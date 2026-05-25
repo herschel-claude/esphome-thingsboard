@@ -9,8 +9,8 @@ namespace thingsboard {
 
 static const char *TAG = "thingsboard.text";
 
-RpcResult TextHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) {
-  auto *obj = find_entity(App.get_texts(), entity_id);
+RpcResult TextHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id) {
+  auto *obj = find_entity(App.get_texts(), entity_id, device_id);
   if (obj == nullptr) {
     ESP_LOGW(TAG, "Text not found: %s", entity_id.c_str());
     return {ESP_ERR_NOT_FOUND, ""};

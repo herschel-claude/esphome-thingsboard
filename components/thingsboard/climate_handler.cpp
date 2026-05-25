@@ -4,14 +4,16 @@
 
 #include "esphome/components/climate/climate_mode.h"
 #include "esphome/core/log.h"
+#include <cmath>
+#include <cstdlib>
 
 namespace esphome {
 namespace thingsboard {
 
 static const char *TAG = "thingsboard.climate";
 
-RpcResult ClimateHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) {
-  auto *obj = find_entity(App.get_climates(), entity_id);
+RpcResult ClimateHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id) {
+  auto *obj = find_entity(App.get_climates(), entity_id, device_id);
   if (obj == nullptr) {
     ESP_LOGW(TAG, "Climate not found: %s", entity_id.c_str());
     return {ESP_ERR_NOT_FOUND, ""};
@@ -95,8 +97,15 @@ void ClimateHandler::register_shared_attributes(register_fn reg) {
       });
       if (!parsed) {
         // Plain float value = set target temperature
+        char *end = nullptr;
+        float f = std::strtof(value.c_str(), &end);
+        if (end == value.c_str() || !std::isfinite(f)) {
+          ESP_LOGW(TAG, "Climate %s: ignoring non-numeric value '%s'",
+                   obj->get_object_id().c_str(), value.c_str());
+          return;
+        }
         auto call = obj->make_call();
-        call.set_target_temperature(std::stof(value));
+        call.set_target_temperature(f);
         call.perform();
       }
     });

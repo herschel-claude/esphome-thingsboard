@@ -10,8 +10,8 @@ namespace thingsboard {
 
 static const char *TAG = "thingsboard.light";
 
-RpcResult LightHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) {
-  auto *obj = find_entity(App.get_lights(), entity_id);
+RpcResult LightHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id) {
+  auto *obj = find_entity(App.get_lights(), entity_id, device_id);
   if (obj == nullptr) {
     ESP_LOGW(TAG, "Light not found: %s", entity_id.c_str());
     return {ESP_ERR_NOT_FOUND, ""};

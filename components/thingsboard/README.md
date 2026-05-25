@@ -102,6 +102,71 @@ OTA is provided by the per-transport sibling components
 [`thingsboard_http_ota`](../thingsboard_http_ota/) for streaming HTTPS GET);
 see their READMEs for endpoint detail.
 
+## Shared-attribute commands
+
+Every controllable ESPHome entity registers a shared-attribute key derived
+from its domain + object id:
+
+| Domain    | Outbound telemetry / state key | Inbound command key (default)   |
+| --------- | ------------------------------ | ------------------------------- |
+| switch    | `switch.<object_id>`           | `set.switch.<object_id>`        |
+| light     | `light.<object_id>`            | `set.light.<object_id>`         |
+| number    | `number.<object_id>`           | `set.number.<object_id>`        |
+| select    | `select.<object_id>`           | `set.select.<object_id>`        |
+| climate   | `climate.<object_id>`          | `set.climate.<object_id>`      |
+| fan       | `fan.<object_id>`              | `set.fan.<object_id>`           |
+| cover     | `cover.<object_id>`            | `set.cover.<object_id>`         |
+| valve     | `valve.<object_id>`            | `set.valve.<object_id>`         |
+| lock      | `lock.<object_id>`             | `set.lock.<object_id>`          |
+| button    | -                              | `set.button.<object_id>`        |
+| text      | `text.<object_id>`             | `set.text.<object_id>`          |
+| media_player | `media_player.<object_id>`  | `set.media_player.<object_id>` |
+| alarm_control_panel | `alarm.<object_id>`   | `set.alarm.<object_id>`         |
+
+Writing a shared attribute on the SHARED_SCOPE side (`set.switch.heating_1 =
+true`) dispatches into the matching domain handler. Telemetry / state echoes
+stay on the bare key. Per-domain command grammar:
+
+- Switch / lock: `true`/`false` or `ON`/`OFF` (case-insensitive).
+- Number / climate (`target_temperature`) / cover / valve: float scalar, or
+  JSON object for multi-field setpoints.
+- Light: JSON object (state, brightness, color, ...).
+- Select / text: bare string.
+
+Non-numeric values on float-typed handlers are logged and dropped rather
+than crashing the dispatch (see `number_handler.cpp:register_shared_attributes`).
+
+### Configurable prefixes
+
+- `command_prefix` (default `"set."`): inbound command-attribute prefix.
+  Override at the YAML level when an existing TB-side convention is in use.
+- `state_prefix` (default `""`): outbound client-attribute (state echo)
+  prefix. Default `""` keeps state echoes on the same scoped id as
+  telemetry. Set to e.g. `"state."` to namespace state echoes separately
+  on TB so scope-agnostic widgets read a single deterministic value per
+  key. Mirrors the wire-level `gw_pending_` dedup separation in commit
+  592a565 at the TB key level.
+
+```yaml
+thingsboard:
+  server_url: !secret thingsboard_server_url
+  device_name: ${name}
+  command_prefix: "set."   # default
+  state_prefix: ""         # default; set "state." to namespace state echoes
+```
+
+Connect-time, every registered `<command_prefix><domain>.<object_id>` key
+is folded into the bootstrap `sharedKeys` request so setpoints survive a
+reboot before the first server-side push. Non-scalar attribute values
+(JSON objects, arrays) are now serialised through to handlers rather than
+being dropped as `"unknown"`.
+
+**Breaking change vs. pre-1.0:** handlers used to register bare object_ids.
+SHARED_SCOPE writes targeting bare `heating_1` no longer dispatch; migrate
+to `set.switch.heating_1` (or set `command_prefix: ""` if you must keep
+the old convention -- collisions with telemetry keys then become your
+responsibility).
+
 ## Files
 
 - `transport.h`: `TBTransport` interface implemented by each transport

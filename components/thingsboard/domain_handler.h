@@ -89,9 +89,11 @@ class DomainHandler {
 
   virtual const char *domain() const = 0;
 
+  // `device_id` scopes resolution to one ESPHome sub-device (0 = main device).
+  // Threaded through to find_entity; only meaningful when USE_DEVICES is set.
   virtual RpcResult handle_rpc(const std::string &method,
                                const std::string &entity_id,
-                               JsonObject params) = 0;
+                               JsonObject params, uint32_t device_id = 0) = 0;
 
   virtual void register_shared_attributes(register_fn reg) = 0;
 
@@ -114,11 +116,22 @@ class DomainHandler {
   }
 };
 
-/// Find a non-internal entity by object_id in the given container
+/// Find a non-internal entity by object_id in the given container.
+/// `device_id` scopes the search to one ESPHome sub-device: 0 is the main
+/// device, non-zero a sub-device. The filter only exists when USE_DEVICES is
+/// set (i.e. the YAML declares `esphome: devices:`); otherwise `device_id` is
+/// inert and every entity resolves as the main device, exactly as before.
 template<typename Container>
-typename Container::value_type find_entity(const Container &entities, const std::string &object_id) {
+typename Container::value_type find_entity(const Container &entities,
+                                           const std::string &object_id,
+                                           uint32_t device_id = 0) {
   for (auto *obj : entities) {
     if (obj->is_internal()) continue;
+#ifdef USE_DEVICES
+    if (obj->get_device_id() != device_id) continue;
+#else
+    (void) device_id;
+#endif
     char buf[OBJECT_ID_MAX_LEN];
     if (obj->get_object_id_to(buf) == object_id) {
       return obj;

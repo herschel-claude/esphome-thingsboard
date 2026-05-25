@@ -104,12 +104,20 @@ void ControlIterator::discover_controls() {
   this->handlers_.push_back(new TextHandler());
 #endif
 
-  register_fn reg = [this](const std::string &key, std::function<void(const std::string &)> handler) {
-    this->register_attribute_handler(key, handler);
-  };
-
+  // Wrap each handler-registered object_id as `<prefix><domain>.<object_id>`
+  // so command attributes never collide with the matching telemetry key
+  // (`<domain>.<object_id>` from get_domain_scoped_id_). Without the prefix
+  // TB's scope-agnostic read paths (UI widgets, ANY_SCOPE subs) can't tell
+  // a control-write from a state-read.
   size_t total_entities = 0;
   for (auto *handler : this->handlers_) {
+    const std::string domain_prefix =
+        this->command_prefix_ + handler->domain() + ".";
+    register_fn reg =
+        [this, domain_prefix](const std::string &object_id,
+                              std::function<void(const std::string &)> cb) {
+          this->register_attribute_handler(domain_prefix + object_id, cb);
+        };
     handler->register_shared_attributes(reg);
     size_t count = handler->entity_count();
     if (count > 0) {
@@ -122,12 +130,14 @@ void ControlIterator::discover_controls() {
            total_entities, this->handlers_.size(), this->attribute_handlers_.size());
 }
 
-esp_err_t ControlIterator::handle_rpc(const std::string &method, const std::string &params) {
+esp_err_t ControlIterator::handle_rpc(const std::string &method, const std::string &params,
+                                      uint32_t device_id) {
   std::string response;
-  return this->handle_rpc_with_response(method, params, response);
+  return this->handle_rpc_with_response(method, params, response, device_id);
 }
 
-esp_err_t ControlIterator::handle_rpc_with_response(const std::string &method, const std::string &params, std::string &response) {
+esp_err_t ControlIterator::handle_rpc_with_response(const std::string &method, const std::string &params,
+                                                    std::string &response, uint32_t device_id) {
   ESP_LOGV(TAG, "Handling RPC: %s with params: %s", method.c_str(), params.c_str());
 
   size_t dot_pos = method.find('.');
@@ -179,7 +189,7 @@ esp_err_t ControlIterator::handle_rpc_with_response(const std::string &method, c
       entity_id = root["entity_id"].as<std::string>();
     }
 
-    RpcResult result = handler->handle_rpc(method_name, entity_id, root);
+    RpcResult result = handler->handle_rpc(method_name, entity_id, root, device_id);
     if (result.err == ESP_OK) {
       if (!result.state_json.empty()) {
         response = json::build_json([&result](JsonObject root) {
@@ -240,6 +250,15 @@ void ControlIterator::handle_shared_attributes(const std::map<std::string, std::
 
 void ControlIterator::register_attribute_handler(const std::string &key, std::function<void(const std::string&)> handler) {
   this->attribute_handlers_[key] = handler;
+}
+
+std::vector<std::string> ControlIterator::get_command_keys() const {
+  std::vector<std::string> keys;
+  keys.reserve(this->attribute_handlers_.size());
+  for (const auto &kv : this->attribute_handlers_) {
+    keys.push_back(kv.first);
+  }
+  return keys;
 }
 
 DomainHandler *ControlIterator::find_handler(const std::string &domain) {

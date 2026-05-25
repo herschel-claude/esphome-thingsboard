@@ -9,8 +9,8 @@ namespace thingsboard {
 
 static const char *TAG = "thingsboard.switch";
 
-RpcResult SwitchHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) {
-  auto *obj = find_entity(App.get_switches(), entity_id);
+RpcResult SwitchHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id) {
+  auto *obj = find_entity(App.get_switches(), entity_id, device_id);
   if (obj == nullptr) {
     ESP_LOGW(TAG, "Switch not found: %s", entity_id.c_str());
     return {ESP_ERR_NOT_FOUND, ""};

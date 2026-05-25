@@ -76,14 +76,19 @@ void ThingsBoardComponent::setup() {
 
   this->load_device_token_();
 
+  this->control_iterator_.set_command_prefix(this->command_prefix_);
   this->control_iterator_.discover_controls();
   ESP_LOGD(TAG, "Control iterator initialized for RPC handling");
 }
 
 void ThingsBoardComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "ThingsBoard:");
-  ESP_LOGCONFIG(TAG, "  MQTT Broker: %s:%d", this->mqtt_broker_.c_str(),
-                this->mqtt_port_);
+  // mqtt_broker_ is only populated by the thingsboard_mqtt component; HTTP-only
+  // builds leave it empty. Print it only when actually configured.
+  if (!this->mqtt_broker_.empty()) {
+    ESP_LOGCONFIG(TAG, "  MQTT Broker: %s:%d", this->mqtt_broker_.c_str(),
+                  this->mqtt_port_);
+  }
   ESP_LOGCONFIG(TAG, "  Device Name: %s", this->device_name_.c_str());
   ESP_LOGCONFIG(TAG, "  Telemetry: Batched with deduplication");
   ESP_LOGCONFIG(TAG, "  Telemetry Interval: %ums%s",
@@ -157,6 +162,12 @@ void ThingsBoardComponent::loop() {
     this->check_provisioning_status_();
   }
 
+  // Drains the connect-time publish chain (metadata, getSessionLimits, OTA
+  // attribute snapshot, initial-state begin, gateway replay). dispatch_connected
+  // sets bootstrap_phase_ = BOOT_METADATA; this advances one phase per tick
+  // through the rate-limit counter. No-op when BOOT_NONE/BOOT_DONE.
+  this->process_bootstrap_();
+
   if (!this->initial_states_sent_ && this->initial_state_iterator_ &&
       !this->initial_state_iterator_->completed()) {
     this->process_initial_state_batch_();
@@ -176,6 +187,16 @@ void ThingsBoardComponent::loop() {
       (now - this->last_all_telemetry_ > this->all_telemetry_interval_)) {
     this->last_all_telemetry_ = now;
     this->send_all_components_telemetry_();
+  }
+
+  // Reconnect backoff reset: a connection alive past the stable threshold is
+  // healthy, so drop the retry interval back to the floor.
+  if (this->connection_active_ &&
+      this->connection_retry_interval_ > MIN_RETRY_INTERVAL_MS &&
+      now - this->connected_at_ >= STABLE_CONNECTION_MS) {
+    this->connection_retry_interval_ = MIN_RETRY_INTERVAL_MS;
+    ESP_LOGD(TAG, "Connection stable; reconnect backoff reset to %us",
+             this->connection_retry_interval_ / 1000);
   }
 }
 
@@ -652,6 +673,17 @@ ThingsBoardComponent::get_domain_scoped_id_(const std::string &domain,
   return domain + "." + std::string(obj->get_object_id_to(buf));
 }
 
+uint32_t
+ThingsBoardComponent::entity_device_id_(const EntityBase *obj) const {
+#ifdef USE_DEVICES
+  // EntityBase::get_device_id() already returns 0 for a null (main) device.
+  return obj->get_device_id();
+#else
+  (void) obj;
+  return 0;
+#endif
+}
+
 void ThingsBoardComponent::emit_handler_telemetry_(const std::string &domain,
                                                    EntityBase *obj) {
   DomainHandler *handler = this->control_iterator_.find_handler(domain);
@@ -662,11 +694,16 @@ void ThingsBoardComponent::emit_handler_telemetry_(const std::string &domain,
   }
   // Compose `domain.object_id.subkey` as the TB telemetry key. Each subkey
   // value is a JSON literal already (number/`true`/`"escaped"`), suitable for
-  // verbatim splicing via add_to_batch_.
+  // verbatim splicing. When the entity belongs to a sub-device, the whole
+  // field set routes to that gateway child instead of the device-API batch.
   const std::string scope = this->get_domain_scoped_id_(domain, obj);
+  const uint32_t device_id = this->entity_device_id_(obj);
   handler->append_telemetry_fields(
-      obj, [this, &scope](const std::string &subkey, const std::string &v) {
-        this->add_to_batch_(scope + "." + subkey, v, /*is_attribute=*/false);
+      obj,
+      [this, &scope, device_id](const std::string &subkey,
+                                const std::string &v) {
+        this->route_single_datapoint_(scope + "." + subkey, v,
+                                      /*is_attribute=*/false, device_id);
       });
 }
 
@@ -679,6 +716,8 @@ void ThingsBoardComponent::setup_mqtt_() {
   this->mqtt_client_->set_parent_component(this);
   this->mqtt_client_->set_broker(this->mqtt_broker_, this->mqtt_port_);
   this->mqtt_client_->set_client_id(this->device_name_);
+  this->mqtt_client_->set_publish_qos(this->mqtt_publish_qos_);
+  this->mqtt_client_->set_publish_retain(this->mqtt_publish_retain_);
 
   if (!this->mqtt_server_ca_pem_.empty()) {
     this->mqtt_client_->set_server_ca(this->mqtt_server_ca_pem_);
@@ -755,10 +794,10 @@ void ThingsBoardComponent::on_mqtt_connect_() {
     return;
   }
 
-  // getSessionLimits is MQTT-only.
-  if (!this->rate_limits_.limits_received_) {
-    this->request_session_limits_();
-  }
+  // getSessionLimits is now requested from BOOT_REQUEST_LIMITS in
+  // process_bootstrap_(), so the publish is rate-counter gated like every
+  // other connect-burst publish. on_mqtt_connect_ only logs + handles the
+  // provisioning branch.
 }
 
 void ThingsBoardComponent::on_mqtt_disconnect_() {
@@ -790,31 +829,173 @@ void ThingsBoardComponent::on_mqtt_auth_failure_() {
 void ThingsBoardComponent::dispatch_connected() {
   ESP_LOGI(TAG, "Connected to ThingsBoard");
   this->status_clear_warning();
-  // Publish current_fw_title/version so TB can match against assigned OTA
-  // packages.
-  this->send_device_metadata_();
-  if (!this->initial_states_sent_) {
-    if (!this->initial_state_iterator_) {
-      this->initial_state_iterator_ =
-          std::make_unique<InitialStateIterator>(this);
-    }
-    this->initial_state_iterator_->begin(/*include_internal=*/true);
-  }
-  // Snapshot fw_*/sw_* attributes so a TB-side OTA assignment that pre-dated
-  // this connection (or raced the shared-attr push window) still reaches the
-  // OTA bridge.
-  if (this->ota_transport_ != nullptr) {
-    this->request_attributes(
-        "{\"sharedKeys\":\"fw_title,fw_version,fw_size,fw_checksum,"
-        "fw_checksum_algorithm,sw_title,sw_version,sw_size,sw_checksum,"
-        "sw_checksum_algorithm\"}");
-  }
+  // Mark the connection start for the reconnect-backoff state machine and the
+  // getSessionLimits grace window; the backoff interval resets once this
+  // connection survives STABLE_CONNECTION_MS (loop()).
+  this->connected_at_ = millis();
+  this->connection_active_ = true;
+  // Hand off the post-connect work to the bootstrap phase machine. Doing
+  // metadata + RPC + initial-state publishes synchronously from here packs
+  // every connect into one loop tick and trips TB's per-device rate limit;
+  // process_bootstrap_() runs each phase from loop() under the same counter
+  // gate the batch flusher uses. See BootstrapPhase docs in the header.
+  this->bootstrap_phase_ = BOOT_METADATA;
   this->connect_trigger_.trigger();
 }
 
 void ThingsBoardComponent::dispatch_disconnected() {
   ESP_LOGW(TAG, "Disconnected from ThingsBoard");
+  // Reconnect backoff: a connection that never reached the stable threshold (a
+  // flood-and-drop, or a connect that failed outright) doubles the retry
+  // interval so the next attempt gives TB's rate-limit window time to drain. A
+  // connection that *was* stable keeps the floor interval -- loop() reset it.
+  const uint32_t now = millis();
+  const bool was_stable = this->connection_active_ &&
+                          now - this->connected_at_ >= STABLE_CONNECTION_MS;
+  if (!was_stable && this->connection_retry_interval_ < MAX_RETRY_INTERVAL_MS) {
+    const uint32_t doubled = this->connection_retry_interval_ * 2;
+    this->connection_retry_interval_ =
+        doubled > MAX_RETRY_INTERVAL_MS ? MAX_RETRY_INTERVAL_MS : doubled;
+    ESP_LOGW(TAG, "Reconnect backoff: next attempt in %us",
+             this->connection_retry_interval_ / 1000);
+  }
+  this->connection_active_ = false;
+  // Disconnect mid-bootstrap: abandon the chain. The next dispatch_connected
+  // restarts it from BOOT_METADATA.
+  this->bootstrap_phase_ = BOOT_NONE;
+#ifdef USE_THINGSBOARD_GATEWAY
+  // Tell the gateway the session is gone so it stops flushing queued telemetry
+  // for children TB no longer has routing for; the next on_core_connected
+  // re-seeds gw_connect first and then re-enables flushing.
+  if (this->gateway_transport_ != nullptr) {
+    this->gateway_transport_->on_core_disconnected();
+  }
+#endif
   this->disconnect_trigger_.trigger();
+}
+
+// Drives the post-connect publish chain. Called once per loop() tick.
+//
+// Each publishing phase first checks messages_counter_.can_admit(1, now): on
+// false the phase yields (no advance, retried next tick) until TB's bucket
+// drains. After publishing it records(1) so the bucket reflects the publish --
+// previously these connect-burst publishes were not counted, so the very next
+// telemetry tick thought the bucket was empty and overshot.
+//
+// BOOT_WAIT_LIMITS holds the OTA/initial-state/gateway phases until the
+// getSessionLimits round-trip completes or LIMITS_GRACE_MS elapses, so the
+// counters carry TB's real tiers before anything downstream publishes.
+void ThingsBoardComponent::process_bootstrap_() {
+  if (this->bootstrap_phase_ == BOOT_NONE ||
+      this->bootstrap_phase_ == BOOT_DONE) {
+    return;
+  }
+  if (!this->is_connected()) {
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  switch (this->bootstrap_phase_) {
+    case BOOT_METADATA: {
+      if (!this->messages_counter_.can_admit(1, now)) return;
+      this->send_device_metadata_();
+      this->messages_counter_.record(1, now);
+      this->bootstrap_phase_ = BOOT_REQUEST_LIMITS;
+      break;
+    }
+    case BOOT_REQUEST_LIMITS: {
+      // limits_received_ is sticky across reconnects; only the very first
+      // connect after boot actually sends the RPC. Subsequent reconnects fall
+      // straight through to BOOT_WAIT_LIMITS, which itself short-circuits.
+      if (!this->rate_limits_.limits_received_) {
+        if (!this->messages_counter_.can_admit(1, now)) return;
+        this->request_session_limits_();
+        this->messages_counter_.record(1, now);
+      }
+      this->bootstrap_phase_ = BOOT_WAIT_LIMITS;
+      this->bootstrap_phase_started_ = now;
+      break;
+    }
+    case BOOT_WAIT_LIMITS: {
+      // Either the response landed (handle_session_limits_response_ flipped
+      // the flag and rebuilt the counters) or TB never answers and we time out
+      // -- after grace the empty counters admit everything anyway.
+      if (this->rate_limits_.limits_received_) {
+        this->bootstrap_phase_ = BOOT_OTA_ATTRS;
+      } else if (static_cast<int32_t>(now - this->bootstrap_phase_started_) >=
+                 static_cast<int32_t>(LIMITS_GRACE_MS)) {
+        ESP_LOGW(TAG,
+                 "getSessionLimits did not respond within %ums; proceeding "
+                 "with empty rate-limit counters",
+                 LIMITS_GRACE_MS);
+        this->bootstrap_phase_ = BOOT_OTA_ATTRS;
+      }
+      break;
+    }
+    case BOOT_OTA_ATTRS: {
+      // Snapshot OTA fw_*/sw_* AND every registered command-attribute key so
+      // an assignment or setpoint that pre-dated this connection (or raced
+      // the push window) still reaches the right handler.
+      // dispatch_attribute_response routes the result. Built unconditionally
+      // -- skip only if there's neither an OTA bridge nor any command key.
+      std::vector<std::string> keys = this->control_iterator_.get_command_keys();
+      if (this->ota_transport_ != nullptr) {
+        static const char *const OTA_KEYS[] = {
+            "fw_title",       "fw_version",       "fw_size", "fw_checksum",
+            "fw_checksum_algorithm",
+            "sw_title",       "sw_version",       "sw_size", "sw_checksum",
+            "sw_checksum_algorithm",
+        };
+        for (const char *k : OTA_KEYS) keys.emplace_back(k);
+      }
+      if (!keys.empty()) {
+        if (!this->messages_counter_.can_admit(1, now)) return;
+        std::string req = "{\"sharedKeys\":\"";
+        for (size_t i = 0; i < keys.size(); ++i) {
+          if (i != 0) req += ",";
+          req += keys[i];
+        }
+        req += "\"}";
+        this->request_attributes(req);
+        this->messages_counter_.record(1, now);
+      }
+      this->bootstrap_phase_ = BOOT_INITIAL_STATES;
+      break;
+    }
+    case BOOT_INITIAL_STATES: {
+      // The iterator only runs once per program lifetime
+      // (initial_states_sent_ is sticky); on reconnects this falls through.
+      // The iterator itself is paced by process_initial_state_batch_ in loop()
+      // through the same counter gate, so it does not need additional gating
+      // here -- just kick it off.
+      if (!this->initial_states_sent_) {
+        if (!this->initial_state_iterator_) {
+          this->initial_state_iterator_ =
+              std::make_unique<InitialStateIterator>(this);
+        }
+        this->initial_state_iterator_->begin(/*include_internal=*/true);
+      }
+      this->bootstrap_phase_ = BOOT_GW_REPLAY;
+      break;
+    }
+    case BOOT_GW_REPLAY: {
+      // Seed the gateway component's replay queue. TB drops the gateway
+      // session's child routing on every reconnect, so the gateway re-issues
+      // gw_connect for every connected child -- staggered through
+      // drain_pending_replay_ which itself rate-gates on the gateway counter.
+      // This call is itself non-publishing (just enqueues), so it doesn't go
+      // through messages_counter_.
+      if (this->gateway_transport_ != nullptr) {
+        this->gateway_transport_->on_core_connected();
+      }
+      this->bootstrap_phase_ = BOOT_DONE;
+      break;
+    }
+    case BOOT_NONE:
+    case BOOT_DONE:
+      break;
+  }
 }
 
 void ThingsBoardComponent::dispatch_rpc_request(const std::string &request_id,
@@ -822,6 +1003,20 @@ void ThingsBoardComponent::dispatch_rpc_request(const std::string &request_id,
                                                 const std::string &params) {
   ESP_LOGD(TAG, "Received RPC request: %s with params: %s", method.c_str(),
            params.c_str());
+
+  // "gateway_device_renamed" / "gateway_device_deleted" are TB-reserved service
+  // RPCs: they arrive on this device's own rpc/request/* topic (not
+  // v1/gateway/rpc) but target the gateway's child registry, not a local
+  // entity. Forward to the gateway component (empty device_name = service RPC),
+  // ack immediately, and return so the ControlIterator never sees them.
+  if (this->gateway_transport_ != nullptr &&
+      (method == "gateway_device_renamed" ||
+       method == "gateway_device_deleted")) {
+    this->gateway_transport_->on_gateway_rpc_request("", request_id, method,
+                                                     params);
+    this->send_immediate_rpc_response_(request_id, "{}");
+    return;
+  }
 
   this->rpc_trigger_.trigger(method, params);
 
@@ -903,6 +1098,12 @@ void ThingsBoardComponent::dispatch_attribute_response(
   // between polls (or before connect) would be missed. The snapshot response
   // carries the same fw_*/sw_* shape and feeds the same OTA bridge.
   this->maybe_advertise_ota_(attributes);
+
+  // Also fan out into the domain-handler attribute dispatcher so a setpoint
+  // (`set.<domain>.<object_id>`) that pre-dated this connection survives a
+  // reboot. handle_shared_attributes is a no-op for any key that lacks a
+  // registered handler, so fw_*/sw_* pass through harmlessly.
+  this->control_iterator_.handle_shared_attributes(attributes);
 }
 
 void ThingsBoardComponent::dispatch_provision_response(
@@ -910,34 +1111,78 @@ void ThingsBoardComponent::dispatch_provision_response(
   this->handle_provision_response_(response_json);
 }
 
-void ThingsBoardComponent::send_single_telemetry_(const std::string &key,
-                                                  float value) {
-  if (!this->is_connected()) return;
-  this->add_to_batch_(key, std::to_string(value), false);
+// Route an already-JSON-encoded datapoint either to the device-API batch or,
+// when it belongs to an ESPHome sub-device and a gateway component is present,
+// to that gateway's child batch. Shared tail of the send_single_* overloads.
+void ThingsBoardComponent::route_single_datapoint_(const std::string &key,
+                                                   const std::string &json_value,
+                                                   bool is_attribute,
+                                                   uint32_t device_id) {
+  // State-echo prefixing (SA-M1b): when state_prefix_ is set and this is a
+  // client attribute carrying a domain-scoped id (`<domain>.<object_id>`),
+  // wrap the key so it never collides with the matching telemetry datapoint
+  // on TB's scope-agnostic read paths. Bare keys (fw_state, etc.) are left
+  // alone -- they're not domain handler echoes.
+  const std::string &emit_key =
+      (is_attribute && !this->state_prefix_.empty() &&
+       key.find('.') != std::string::npos)
+          ? (this->state_prefix_ + key)
+          : key;
+
+  // A sub-device entity goes to the gateway only if a gateway component is
+  // registered AND it actually maps that sub-device; otherwise it stays on the
+  // device-API batch (keyed `domain.object_id` on the main device, as before).
+  if (device_id != 0 && this->gateway_transport_ != nullptr &&
+      this->gateway_transport_->ingest_child_telemetry(device_id, emit_key,
+                                                       json_value,
+                                                       is_attribute)) {
+    return;
+  }
+  this->add_to_batch_(emit_key, json_value, is_attribute);
 }
 
 void ThingsBoardComponent::send_single_telemetry_(const std::string &key,
-                                                  const std::string &value) {
+                                                  float value,
+                                                  uint32_t device_id) {
   if (!this->is_connected()) return;
-  this->add_to_batch_(key, encode_json_string(value), false);
+  // std::to_string(NaN) returns the literal "nan" which TB's MQTT acceptor
+  // rejects as PAYLOAD_FORMAT_INVALID and closes the socket -- a single NaN
+  // reading (e.g. mlx90614 ambient on a cold-start sensor, or a sensor with no
+  // valid sample yet) FINs the entire session. Same for +/-inf. Drop the
+  // datapoint silently; the next valid reading replaces it.
+  if (!std::isfinite(value)) return;
+  this->route_single_datapoint_(key, std::to_string(value), false, device_id);
+}
+
+void ThingsBoardComponent::send_single_telemetry_(const std::string &key,
+                                                  const std::string &value,
+                                                  uint32_t device_id) {
+  if (!this->is_connected()) return;
+  this->route_single_datapoint_(key, encode_json_string(value), false,
+                                device_id);
 }
 
 void ThingsBoardComponent::send_single_client_attribute_(const std::string &key,
-                                                         bool value) {
+                                                         bool value,
+                                                         uint32_t device_id) {
   if (!this->is_connected()) return;
-  this->add_to_batch_(key, value ? "true" : "false", true);
+  this->route_single_datapoint_(key, value ? "true" : "false", true, device_id);
 }
 
 void ThingsBoardComponent::send_single_client_attribute_(const std::string &key,
-                                                         float value) {
+                                                         float value,
+                                                         uint32_t device_id) {
   if (!this->is_connected()) return;
-  this->add_to_batch_(key, std::to_string(value), true);
+  // See the NaN/inf rationale in send_single_telemetry_(float).
+  if (!std::isfinite(value)) return;
+  this->route_single_datapoint_(key, std::to_string(value), true, device_id);
 }
 
 void ThingsBoardComponent::send_single_client_attribute_(
-    const std::string &key, const std::string &value) {
+    const std::string &key, const std::string &value, uint32_t device_id) {
   if (!this->is_connected()) return;
-  this->add_to_batch_(key, encode_json_string(value), true);
+  this->route_single_datapoint_(key, encode_json_string(value), true,
+                                device_id);
 }
 
 #ifdef USE_SENSOR
@@ -946,7 +1191,8 @@ void ThingsBoardComponent::on_sensor_update(sensor::Sensor *obj) {
     return;
   float state = obj->state;
 
-  this->send_single_telemetry_(this->get_domain_scoped_id_("sensor", obj), state);
+  this->send_single_telemetry_(this->get_domain_scoped_id_("sensor", obj), state,
+                               this->entity_device_id_(obj));
 }
 #endif
 
@@ -957,8 +1203,9 @@ void ThingsBoardComponent::on_binary_sensor_update(
     return;
 
   std::string scoped_id = this->get_domain_scoped_id_("binary_sensor", obj);
-  this->send_single_telemetry_(scoped_id, obj->state ? 1.0f : 0.0f);
-  this->send_single_client_attribute_(scoped_id, obj->state);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, obj->state ? 1.0f : 0.0f, device_id);
+  this->send_single_client_attribute_(scoped_id, obj->state, device_id);
 }
 #endif
 
@@ -969,8 +1216,9 @@ void ThingsBoardComponent::on_switch_update(switch_::Switch *obj) {
   bool state = obj->state;
 
   std::string scoped_id = this->get_domain_scoped_id_("switch", obj);
-  this->send_single_telemetry_(scoped_id, state ? 1.0f : 0.0f);
-  this->send_single_client_attribute_(scoped_id, state);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, state ? 1.0f : 0.0f, device_id);
+  this->send_single_client_attribute_(scoped_id, state, device_id);
 }
 #endif
 
@@ -983,8 +1231,9 @@ void ThingsBoardComponent::on_number_update(number::Number *obj) {
   ESP_LOGV(TAG, "Number '%s' updated: %.2f", obj->get_name().c_str(), state);
 
   std::string scoped_id = this->get_domain_scoped_id_("number", obj);
-  this->send_single_telemetry_(scoped_id, state);
-  this->send_single_client_attribute_(scoped_id, state);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, state, device_id);
+  this->send_single_client_attribute_(scoped_id, state, device_id);
 }
 #endif
 
@@ -999,8 +1248,9 @@ void ThingsBoardComponent::on_select_update(select::Select *obj) {
            state.c_str());
 
   std::string scoped_id = this->get_domain_scoped_id_("select", obj);
-  this->send_single_telemetry_(scoped_id, static_cast<float>(index));
-  this->send_single_client_attribute_(scoped_id, state);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, static_cast<float>(index), device_id);
+  this->send_single_client_attribute_(scoped_id, state, device_id);
 }
 #endif
 
@@ -1010,7 +1260,8 @@ void ThingsBoardComponent::on_text_sensor_update(text_sensor::TextSensor *obj) {
     return;
   const std::string &state = obj->state;
 
-  this->send_single_telemetry_(this->get_domain_scoped_id_("text_sensor", obj), state);
+  this->send_single_telemetry_(this->get_domain_scoped_id_("text_sensor", obj),
+                               state, this->entity_device_id_(obj));
 }
 #endif
 
@@ -1053,8 +1304,9 @@ void ThingsBoardComponent::on_text_update(text::Text *obj,
     return;
 
   std::string scoped_id = this->get_domain_scoped_id_("text", obj);
-  this->send_single_telemetry_(scoped_id, state);
-  this->send_single_client_attribute_(scoped_id, state);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, state, device_id);
+  this->send_single_client_attribute_(scoped_id, state, device_id);
 }
 #endif
 
@@ -1066,8 +1318,9 @@ void ThingsBoardComponent::on_date_update(datetime::DateEntity *obj) {
   std::string date_str =
       str_sprintf("%04d-%02d-%02d", obj->year, obj->month, obj->day);
   std::string scoped_id = this->get_domain_scoped_id_("date", obj);
-  this->send_single_telemetry_(scoped_id, date_str);
-  this->send_single_client_attribute_(scoped_id, date_str);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, date_str, device_id);
+  this->send_single_client_attribute_(scoped_id, date_str, device_id);
 }
 #endif
 
@@ -1079,8 +1332,9 @@ void ThingsBoardComponent::on_time_update(datetime::TimeEntity *obj) {
   std::string time_str =
       str_sprintf("%02d:%02d:%02d", obj->hour, obj->minute, obj->second);
   std::string scoped_id = this->get_domain_scoped_id_("time", obj);
-  this->send_single_telemetry_(scoped_id, time_str);
-  this->send_single_client_attribute_(scoped_id, time_str);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, time_str, device_id);
+  this->send_single_client_attribute_(scoped_id, time_str, device_id);
 }
 #endif
 
@@ -1093,8 +1347,9 @@ void ThingsBoardComponent::on_datetime_update(datetime::DateTimeEntity *obj) {
       str_sprintf("%04d-%02d-%02d %02d:%02d:%02d", obj->year, obj->month,
                   obj->day, obj->hour, obj->minute, obj->second);
   std::string scoped_id = this->get_domain_scoped_id_("datetime", obj);
-  this->send_single_telemetry_(scoped_id, datetime_str);
-  this->send_single_client_attribute_(scoped_id, datetime_str);
+  uint32_t device_id = this->entity_device_id_(obj);
+  this->send_single_telemetry_(scoped_id, datetime_str, device_id);
+  this->send_single_client_attribute_(scoped_id, datetime_str, device_id);
 }
 #endif
 
@@ -1138,7 +1393,8 @@ void ThingsBoardComponent::on_event(event::Event *obj,
   if (obj->is_internal() || !this->is_connected())
     return;
 
-  this->send_single_telemetry_(this->get_domain_scoped_id_("event", obj), event_type);
+  this->send_single_telemetry_(this->get_domain_scoped_id_("event", obj),
+                               event_type, this->entity_device_id_(obj));
 }
 #endif
 
@@ -1149,7 +1405,8 @@ void ThingsBoardComponent::on_update(update::UpdateEntity *obj) {
 
   bool update_available = obj->state == update::UPDATE_STATE_AVAILABLE;
   this->send_single_telemetry_(this->get_domain_scoped_id_("update", obj),
-                               update_available ? 1.0f : 0.0f);
+                               update_available ? 1.0f : 0.0f,
+                               this->entity_device_id_(obj));
 }
 #endif
 
@@ -1189,7 +1446,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
 #ifdef USE_SENSOR
   for (auto *obj : App.get_sensors()) {
     if (!obj->is_internal() && !std::isnan(obj->state)) {
-      this->send_single_telemetry_(this->get_domain_scoped_id_("sensor", obj), obj->state);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("sensor", obj),
+                                   obj->state, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1197,8 +1455,9 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
 #ifdef USE_BINARY_SENSOR
   for (auto *obj : App.get_binary_sensors()) {
     if (!obj->is_internal() && obj->has_state()) {
-      this->send_single_telemetry_(this->get_domain_scoped_id_("binary_sensor", obj),
-                                   obj->state ? 1.0f : 0.0f);
+      this->send_single_telemetry_(
+          this->get_domain_scoped_id_("binary_sensor", obj),
+          obj->state ? 1.0f : 0.0f, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1207,7 +1466,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
   for (auto *obj : App.get_switches()) {
     if (!obj->is_internal()) {
       this->send_single_telemetry_(this->get_domain_scoped_id_("switch", obj),
-                                   obj->state ? 1.0f : 0.0f);
+                                   obj->state ? 1.0f : 0.0f,
+                                   this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1215,7 +1475,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
 #ifdef USE_NUMBER
   for (auto *obj : App.get_numbers()) {
     if (!obj->is_internal() && !std::isnan(obj->state)) {
-      this->send_single_telemetry_(this->get_domain_scoped_id_("number", obj), obj->state);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("number", obj),
+                                   obj->state, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1225,7 +1486,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
     if (!obj->is_internal() && obj->has_state()) {
       size_t index = obj->active_index().value_or(0);
       this->send_single_telemetry_(this->get_domain_scoped_id_("select", obj),
-                                   static_cast<float>(index));
+                                   static_cast<float>(index),
+                                   this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1233,7 +1495,9 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
 #ifdef USE_TEXT_SENSOR
   for (auto *obj : App.get_text_sensors()) {
     if (!obj->is_internal() && obj->has_state()) {
-      this->send_single_telemetry_(this->get_domain_scoped_id_("text_sensor", obj), obj->state);
+      this->send_single_telemetry_(
+          this->get_domain_scoped_id_("text_sensor", obj), obj->state,
+          this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1269,7 +1533,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
 #ifdef USE_TEXT
   for (auto *obj : App.get_texts()) {
     if (!obj->is_internal()) {
-      this->send_single_telemetry_(this->get_domain_scoped_id_("text", obj), obj->state);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("text", obj),
+                                   obj->state, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1279,7 +1544,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
     if (!obj->is_internal()) {
       std::string date_str =
           str_sprintf("%04d-%02d-%02d", obj->year, obj->month, obj->day);
-      this->send_single_telemetry_(this->get_domain_scoped_id_("date", obj), date_str);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("date", obj),
+                                   date_str, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1289,7 +1555,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
     if (!obj->is_internal()) {
       std::string time_str =
           str_sprintf("%02d:%02d:%02d", obj->hour, obj->minute, obj->second);
-      this->send_single_telemetry_(this->get_domain_scoped_id_("time", obj), time_str);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("time", obj),
+                                   time_str, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1300,7 +1567,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
       std::string datetime_str =
           str_sprintf("%04d-%02d-%02d %02d:%02d:%02d", obj->year, obj->month,
                       obj->day, obj->hour, obj->minute, obj->second);
-      this->send_single_telemetry_(this->get_domain_scoped_id_("datetime", obj), datetime_str);
+      this->send_single_telemetry_(this->get_domain_scoped_id_("datetime", obj),
+                                   datetime_str, this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1338,7 +1606,8 @@ void ThingsBoardComponent::send_all_components_telemetry_() {
     if (!obj->is_internal()) {
       bool update_available = obj->state == update::UPDATE_STATE_AVAILABLE;
       this->send_single_telemetry_(this->get_domain_scoped_id_("update", obj),
-                                   update_available ? 1.0f : 0.0f);
+                                   update_available ? 1.0f : 0.0f,
+                                   this->entity_device_id_(obj));
     }
   }
 #endif
@@ -1369,7 +1638,7 @@ void ThingsBoardComponent::request_session_limits_() {
 
 void ThingsBoardComponent::handle_session_limits_response_(
     const std::string &response) {
-  ESP_LOGD(TAG, "Received session limits response: %s", response.c_str());
+  ESP_LOGI(TAG, "Received session limits response: %s", response.c_str());
 
   json::parse_json(response, [this](JsonObject root) -> bool {
     if (root["maxPayloadSize"].is<int>()) {
@@ -1395,16 +1664,51 @@ void ThingsBoardComponent::handle_session_limits_response_(
       }
     }
 
+#ifdef USE_THINGSBOARD_GATEWAY
+    // Gateway children have their own budget. TB returns it as a top-level
+    // `gatewayRateLimits` object; tolerate a nested
+    // rateLimits.gatewayRateLimits too, since placement has varied across TB
+    // versions. Absent -> counters stay empty -> can_admit() admits.
+    JsonObject gw_limits;
+    if (root["gatewayRateLimits"].is<JsonObject>()) {
+      gw_limits = root["gatewayRateLimits"];
+    } else if (root["rateLimits"]["gatewayRateLimits"].is<JsonObject>()) {
+      gw_limits = root["rateLimits"]["gatewayRateLimits"];
+    }
+    if (!gw_limits.isNull()) {
+      if (gw_limits["messages"].is<const char *>()) {
+        this->rate_limits_.gateway_messages_rate_limit_ =
+            gw_limits["messages"].as<std::string>();
+      }
+      if (gw_limits["telemetryMessages"].is<const char *>()) {
+        this->rate_limits_.gateway_telemetry_messages_rate_limit_ =
+            gw_limits["telemetryMessages"].as<std::string>();
+      }
+      if (gw_limits["telemetryDataPoints"].is<const char *>()) {
+        this->rate_limits_.gateway_telemetry_data_points_rate_limit_ =
+            gw_limits["telemetryDataPoints"].as<std::string>();
+      }
+    }
+#endif
+
     this->rate_limits_.limits_received_ = true;
     this->rebuild_rate_limit_counters_();
     ESP_LOGI(TAG, "Session limits: maxPayload=%u, maxInflight=%u",
              this->rate_limits_.max_payload_size_,
              this->rate_limits_.max_inflight_messages_);
-    ESP_LOGD(TAG,
+    ESP_LOGI(TAG,
              "Rate limits: messages=%s, telemetryMsgs=%s, telemetryPoints=%s",
              this->rate_limits_.messages_rate_limit_.c_str(),
              this->rate_limits_.telemetry_messages_rate_limit_.c_str(),
              this->rate_limits_.telemetry_data_points_rate_limit_.c_str());
+#ifdef USE_THINGSBOARD_GATEWAY
+    ESP_LOGI(
+        TAG,
+        "Gateway rate limits: messages=%s, telemetryMsgs=%s, telemetryPoints=%s",
+        this->rate_limits_.gateway_messages_rate_limit_.c_str(),
+        this->rate_limits_.gateway_telemetry_messages_rate_limit_.c_str(),
+        this->rate_limits_.gateway_telemetry_data_points_rate_limit_.c_str());
+#endif
     return true;
   });
 }
@@ -1458,14 +1762,55 @@ void ThingsBoardComponent::rebuild_rate_limit_counters_() {
       this->rate_limits_.telemetry_messages_rate_limit_);
   this->telemetry_data_points_counter_.parse(
       this->rate_limits_.telemetry_data_points_rate_limit_);
+#ifdef USE_THINGSBOARD_GATEWAY
+  this->gateway_messages_counter_.parse(
+      this->rate_limits_.gateway_messages_rate_limit_);
+  this->gateway_telemetry_messages_counter_.parse(
+      this->rate_limits_.gateway_telemetry_messages_rate_limit_);
+  this->gateway_telemetry_data_points_counter_.parse(
+      this->rate_limits_.gateway_telemetry_data_points_rate_limit_);
+#endif
 }
 
+#ifdef USE_THINGSBOARD_GATEWAY
+bool ThingsBoardComponent::check_gateway_rate_limits(uint32_t n_msgs,
+                                                    uint32_t n_points) {
+  // No limits received yet -> admit. Gateway telemetry only flushes after the
+  // staggered child-connect replay drains (seconds), by which point the
+  // getSessionLimits round-trip has long since completed; this early-out just
+  // covers the corner case of a TB version that never answers the RPC. Empty
+  // specs ("no limit") also admit: a counter with no tiers returns true.
+  if (!this->rate_limits_.limits_received_) return true;
+  const uint32_t now = millis();
+  return this->gateway_messages_counter_.can_admit(n_msgs, now) &&
+         this->gateway_telemetry_messages_counter_.can_admit(n_msgs, now) &&
+         this->gateway_telemetry_data_points_counter_.can_admit(n_points, now);
+}
+
+void ThingsBoardComponent::record_gateway_publish(uint32_t n_msgs,
+                                                  uint32_t n_points) {
+  const uint32_t now = millis();
+  this->gateway_messages_counter_.record(n_msgs, now);
+  this->gateway_telemetry_messages_counter_.record(n_msgs, now);
+  this->gateway_telemetry_data_points_counter_.record(n_points, now);
+}
+#endif
+
 bool ThingsBoardComponent::check_rate_limits_() {
-  if (!this->rate_limits_.limits_received_) {
-    return true;
+  const uint32_t now = millis();
+
+  // Hold the first telemetry batch until getSessionLimits responds, so the
+  // rate-limit counters (enforced per-message in process_partition_) carry
+  // TB's real tiers before anything is published. Without this the connect
+  // burst publishes against empty counters -- TB rate-limits the session and
+  // drops the socket, and the firmware reconnect-loops. limits_received_ stays
+  // true across reconnects, so the hold only applies to the first connect; if
+  // TB never answers the RPC, LIMITS_GRACE_MS bounds the wait.
+  if (!this->rate_limits_.limits_received_ && this->connection_active_ &&
+      now - this->connected_at_ < LIMITS_GRACE_MS) {
+    return false;
   }
 
-  const uint32_t now = millis();
   if (now - this->last_batch_process_ < this->effective_batch_interval_()) {
     return false;
   }

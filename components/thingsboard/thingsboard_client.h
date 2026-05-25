@@ -101,8 +101,29 @@ public:
   // TB's server-receive time.
   void set_use_client_timestamps(bool v) { use_client_timestamps_ = v; }
 
+  // Inbound command-attribute prefix (default `"set."`). Shared attributes
+  // matching `<prefix><domain>.<object_id>` are dispatched into the matching
+  // domain handler -- so writing SHARED_SCOPE `set.switch.relay_1 = ON`
+  // turns relay_1 on, while telemetry/state stays on `switch.relay_1`.
+  void set_command_prefix(const std::string &p) { command_prefix_ = p; }
+  const std::string &command_prefix() const { return command_prefix_; }
+
+  // Outbound client-attribute (state echo) prefix. Default `""` keeps the
+  // historical behaviour where state echoes share the scoped id with
+  // telemetry (`switch.relay_1`). Set to e.g. `"state."` to namespace state
+  // echoes as `state.switch.relay_1` so they never collide with telemetry on
+  // TB's scope-agnostic read paths -- mirrors the wire-level gw_pending_
+  // dedup separation in commit 592a565 at the TB key level.
+  void set_state_prefix(const std::string &p) { state_prefix_ = p; }
+  const std::string &state_prefix() const { return state_prefix_; }
+
   void set_mqtt_broker(const std::string &broker) { mqtt_broker_ = broker; }
   void set_mqtt_port(uint16_t port) { mqtt_port_ = port; }
+  // Default QoS + retain applied to outbound TB publishes. QoS 1 / retain false
+  // is the TB-recommended default; 0/2 and retain=true are exposed for
+  // deployments with bespoke broker conventions.
+  void set_mqtt_publish_qos(uint8_t qos) { mqtt_publish_qos_ = qos; }
+  void set_mqtt_publish_retain(bool retain) { mqtt_publish_retain_ = retain; }
   // MQTT_BASIC credentials (TB MQTT API: client_id + username + password).
   void set_mqtt_basic_credentials(const std::string &client_id,
                                   const std::string &username,
@@ -196,6 +217,50 @@ public:
   // Set only when the active transport offers OTA.
   void register_ota_transport(TBOTATransport *t) { this->ota_transport_ = t; }
   TBOTATransport *get_ota_transport() const { return this->ota_transport_; }
+
+  // Set only when a thingsboard_gateway component is present. The pointer
+  // stays null on plain device builds; every core path null-checks it.
+  void register_gateway_transport(TBGatewayTransport *t) {
+    this->gateway_transport_ = t;
+  }
+  TBGatewayTransport *get_gateway_transport() const {
+    return this->gateway_transport_;
+  }
+
+#ifdef USE_THINGSBOARD_GATEWAY
+  // Gateway children share the connection but carry their own server-side
+  // budget (`gatewayRateLimits` from getSessionLimits). The gateway component
+  // gates each v1/gateway/* publish through these: check_* is admit-or-defer
+  // (does not mutate), record_* commits a publish. Both no-op gracefully until
+  // limits arrive or when TB returns empty gateway specs.
+  bool check_gateway_rate_limits(uint32_t n_msgs, uint32_t n_points);
+  void record_gateway_publish(uint32_t n_msgs, uint32_t n_points);
+
+  // B-layer: the gateway component forwards a `domain.method` RPC for an
+  // ESPHome sub-device here. Resolution is scoped to `device_id` so only that
+  // sub-device's entities match. `response` is filled with the ESPHome
+  // REST-style JSON result for the gateway to publish on `v1/gateway/rpc`.
+  esp_err_t handle_child_rpc(const std::string &method,
+                             const std::string &params, uint32_t device_id,
+                             std::string &response) {
+    return this->control_iterator_.handle_rpc_with_response(method, params,
+                                                            response,
+                                                            device_id);
+  }
+  // B-layer: the gateway component forwards a `v1/gateway/attributes` push
+  // for an ESPHome sub-device here. Routes through the existing per-domain
+  // register_shared_attributes callbacks; those are keyed by bare object_id
+  // today, so this works cleanly when sub-device entity ids are unique across
+  // the firmware (e.g. relay_1/2/3 on sd_relay_1/2/3). Device-id-scoped
+  // routing (so two sub-devices can share an object_id) is the larger ADJ-2
+  // SA-M1 reshape -- when that lands, this delegates to a scoped overload.
+  void handle_child_shared_attributes(
+      const std::map<std::string, std::string> &attributes,
+      uint32_t device_id) {
+    (void) device_id;  // see comment above; not yet used.
+    this->control_iterator_.handle_shared_attributes(attributes);
+  }
+#endif
 
   void dispatch_connected();
   void dispatch_disconnected();
@@ -322,6 +387,8 @@ protected:
 
   std::string mqtt_broker_;
   uint16_t mqtt_port_{1883};
+  uint8_t mqtt_publish_qos_{1};
+  bool mqtt_publish_retain_{false};
   std::string device_token_;
 
   // Optional auth modes wired by the thingsboard_mqtt sibling. ACCESS_TOKEN is
@@ -349,15 +416,74 @@ protected:
   std::shared_ptr<http_request::HttpContainer> provision_container_{nullptr};
 
   uint32_t last_connection_attempt_{0};
-  uint32_t connection_retry_interval_{5000};
+  // Reconnect backoff. A publish burst that trips ThingsBoard's per-device rate
+  // limit gets the session dropped; on a fixed reconnect timer the firmware
+  // re-floods before the sliding window drains, so the loop never breaks.
+  // connection_retry_interval_ doubles on a short-lived connection and resets
+  // once a connection proves stable.
+  static constexpr uint32_t MIN_RETRY_INTERVAL_MS = 5000;
+  static constexpr uint32_t MAX_RETRY_INTERVAL_MS = 60000;
+  // A connection alive at least this long is considered stable: backoff resets.
+  static constexpr uint32_t STABLE_CONNECTION_MS = 30000;
+  // How long the first telemetry batch is held while the getSessionLimits
+  // round-trip completes, so the rate-limit counters carry TB's real tiers
+  // before anything is published. If TB never answers (older versions don't
+  // implement the RPC), publishing proceeds ungated once this elapses.
+  static constexpr uint32_t LIMITS_GRACE_MS = 3000;
+  uint32_t connection_retry_interval_{MIN_RETRY_INTERVAL_MS};
+  // Start of the current connection; only meaningful while connection_active_
+  // is true. A separate bool, not a 0 sentinel: millis() is legitimately 0 for
+  // the first millisecond after boot and wraps back to 0 every ~49.7 days.
+  uint32_t connected_at_{0};
+  bool connection_active_{false};
 
-  // Populated from getSessionLimits RPC.
+  // Bootstrap phase machine. dispatch_connected() used to fire a synchronous
+  // burst of publishes (metadata + getSessionLimits RPC + OTA shared-attr
+  // request + initial-state telemetry + gw_connect-per-child replay), all from
+  // the same loop tick. That burst routinely exceeded ThingsBoard's per-device
+  // sliding-window rate limit (default `20:1`) inside ~1s, and TB FIN'd the
+  // socket -- the firmware then reconnect-looped because every retry replayed
+  // the same burst before the bucket drained.
+  //
+  // process_bootstrap_() drives the chain from loop() instead, advancing one
+  // phase per tick and gating each publishing phase through messages_counter_
+  // exactly like the batch flusher does. Each phase records its publish on the
+  // counter so subsequent ticks see the bucket honestly. dispatch_connected()
+  // is now state-reset-only.
+  enum BootstrapPhase : uint8_t {
+    BOOT_NONE = 0,        // not connected, or bootstrap already drained
+    BOOT_METADATA,        // publish device metadata as client attributes
+    BOOT_REQUEST_LIMITS,  // RPC getSessionLimits (skipped if already received)
+    BOOT_WAIT_LIMITS,     // pause until limits_received_ or LIMITS_GRACE_MS
+    BOOT_OTA_ATTRS,       // request fw_*/sw_* shared-attribute snapshot
+    BOOT_INITIAL_STATES,  // kick off InitialStateIterator (it self-paces)
+    BOOT_GW_REPLAY,       // poke gateway component to replay child registry
+    BOOT_DONE,
+  };
+  BootstrapPhase bootstrap_phase_{BOOT_NONE};
+  // Phase-local clock: set when entering a phase that needs to wait (only
+  // BOOT_WAIT_LIMITS today). millis()-based, wrap-safe via signed subtraction.
+  uint32_t bootstrap_phase_started_{0};
+  // Loop-driven advance. Returns quickly when bootstrap_phase_ == BOOT_NONE
+  // or BOOT_DONE; defers when the counter denies or the wait hasn't elapsed.
+  void process_bootstrap_();
+
+  // Populated from the getSessionLimits RPC. Empty strings mean "no limit": a
+  // RateLimitCounter with no tiers admits everything. The first telemetry batch
+  // is held (check_rate_limits_) until limits_received_ flips, so a publish is
+  // never gated against empty counters except as a last-resort fallback.
   struct RateLimits {
     uint32_t max_payload_size_{65536};
     uint32_t max_inflight_messages_{100};
-    std::string messages_rate_limit_;     // raw string, e.g. "200:1,6000:60,14000:3600"
+    std::string messages_rate_limit_;  // raw, e.g. "200:1,6000:60,14000:3600"
     std::string telemetry_messages_rate_limit_;
     std::string telemetry_data_points_rate_limit_;
+#ifdef USE_THINGSBOARD_GATEWAY
+    // `gatewayRateLimits` from getSessionLimits — applied per child device.
+    std::string gateway_messages_rate_limit_;
+    std::string gateway_telemetry_messages_rate_limit_;
+    std::string gateway_telemetry_data_points_rate_limit_;
+#endif
     bool limits_received_{false};
   } rate_limits_;
 
@@ -382,6 +508,11 @@ protected:
   RateLimitCounter messages_counter_;
   RateLimitCounter telemetry_messages_counter_;
   RateLimitCounter telemetry_data_points_counter_;
+#ifdef USE_THINGSBOARD_GATEWAY
+  RateLimitCounter gateway_messages_counter_;
+  RateLimitCounter gateway_telemetry_messages_counter_;
+  RateLimitCounter gateway_telemetry_data_points_counter_;
+#endif
   void rebuild_rate_limit_counters_();
 
   struct PendingMessage {
@@ -414,6 +545,8 @@ protected:
   // T5 / T7 knobs.
   uint32_t offline_queue_max_{200};
   bool use_client_timestamps_{false};
+  std::string command_prefix_{"set."};
+  std::string state_prefix_{""};
 
   uint32_t last_all_telemetry_{0};
   uint32_t all_telemetry_interval_{30000};
@@ -436,6 +569,8 @@ protected:
   // Active transport (non-owning).
   TBTransport *transport_{nullptr};
   TBOTATransport *ota_transport_{nullptr};
+  // Non-owning; set by a thingsboard_gateway component, null otherwise.
+  TBGatewayTransport *gateway_transport_{nullptr};
 
   Trigger<> connect_trigger_;
   Trigger<> disconnect_trigger_;
@@ -461,12 +596,28 @@ protected:
   void handle_provision_response_(const std::string &response);
   void establish_connection_();
 
-  void send_single_telemetry_(const std::string &key, float value);
-  void send_single_telemetry_(const std::string &key, const std::string &value);
-  void send_single_client_attribute_(const std::string &key, bool value);
-  void send_single_client_attribute_(const std::string &key, float value);
+  // Shared tail of the send_single_* overloads: routes an already-encoded
+  // datapoint to the device-API batch, or to a gateway child when device_id is
+  // a sub-device and a gateway component is registered.
+  void route_single_datapoint_(const std::string &key,
+                               const std::string &json_value,
+                               bool is_attribute, uint32_t device_id);
+
+  // The trailing `device_id` routes a datapoint to a gateway child instead of
+  // the device-API batch: 0 (the default) means the main device; non-zero is
+  // an ESPHome sub-device id, forwarded to gateway_transport_ when one is
+  // registered. Callers pass entity_device_id_(obj).
+  void send_single_telemetry_(const std::string &key, float value,
+                              uint32_t device_id = 0);
+  void send_single_telemetry_(const std::string &key, const std::string &value,
+                              uint32_t device_id = 0);
+  void send_single_client_attribute_(const std::string &key, bool value,
+                                     uint32_t device_id = 0);
+  void send_single_client_attribute_(const std::string &key, float value,
+                                     uint32_t device_id = 0);
   void send_single_client_attribute_(const std::string &key,
-                                     const std::string &value);
+                                     const std::string &value,
+                                     uint32_t device_id = 0);
 
   void send_immediate_telemetry_(const std::string &key,
                                  const std::string &value);
@@ -512,6 +663,12 @@ protected:
   // the legacy on_*_update used to send (T10).
   void emit_handler_telemetry_(const std::string &domain, EntityBase *obj);
 
+  // Resolves the ESPHome sub-device an entity belongs to: 0 for the main
+  // device, non-zero for a sub-device. Always 0 unless USE_DEVICES is set
+  // (the YAML declares `esphome: devices:`). M7 uses this to route a
+  // sub-device's telemetry/RPC through the gateway instead of v1/devices/me/*.
+  uint32_t entity_device_id_(const EntityBase *obj) const;
+
   void setup_mqtt_();
   void connect_mqtt_();
   void on_mqtt_connect_();
@@ -552,7 +709,7 @@ protected:
       if (!std::isnan(obj->state)) {
         parent_->send_single_telemetry_(
             parent_->get_domain_scoped_id_("sensor", obj),
-            obj->state);
+            obj->state, parent_->entity_device_id_(obj));
       }
       return true;
     }
@@ -564,7 +721,7 @@ protected:
         return true;
       parent_->send_single_telemetry_(
           parent_->get_domain_scoped_id_("binary_sensor", obj),
-          obj->state ? 1.0f : 0.0f);
+          obj->state ? 1.0f : 0.0f, parent_->entity_device_id_(obj));
       return true;
     }
 #endif
@@ -586,8 +743,10 @@ protected:
                obj->state ? "ON" : "OFF");
       std::string scoped_id =
           parent_->get_domain_scoped_id_("switch", obj);
-      parent_->send_single_telemetry_(scoped_id, obj->state ? 1.0f : 0.0f);
-      parent_->send_single_client_attribute_(scoped_id, obj->state);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, obj->state ? 1.0f : 0.0f,
+                                      device_id);
+      parent_->send_single_client_attribute_(scoped_id, obj->state, device_id);
       return true;
     }
 #endif
@@ -599,8 +758,10 @@ protected:
       if (!std::isnan(obj->state)) {
         std::string scoped_id =
             parent_->get_domain_scoped_id_("number", obj);
-        parent_->send_single_telemetry_(scoped_id, obj->state);
-        parent_->send_single_client_attribute_(scoped_id, obj->state);
+        uint32_t device_id = parent_->entity_device_id_(obj);
+        parent_->send_single_telemetry_(scoped_id, obj->state, device_id);
+        parent_->send_single_client_attribute_(scoped_id, obj->state,
+                                               device_id);
       }
       return true;
     }
@@ -612,8 +773,9 @@ protected:
         return true;
       std::string scoped_id =
           parent_->get_domain_scoped_id_("text", obj);
-      parent_->send_single_telemetry_(scoped_id, obj->state);
-      parent_->send_single_client_attribute_(scoped_id, obj->state);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, obj->state, device_id);
+      parent_->send_single_client_attribute_(scoped_id, obj->state, device_id);
       return true;
     }
 #endif
@@ -624,8 +786,9 @@ protected:
         return true;
       std::string scoped_id =
           parent_->get_domain_scoped_id_("select", obj);
-      parent_->send_single_telemetry_(scoped_id, obj->state);
-      parent_->send_single_client_attribute_(scoped_id, obj->state);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, obj->state, device_id);
+      parent_->send_single_client_attribute_(scoped_id, obj->state, device_id);
       return true;
     }
 #endif
@@ -638,8 +801,9 @@ protected:
           str_sprintf("%d-%02d-%02d", obj->year, obj->month, obj->day);
       std::string scoped_id =
           parent_->get_domain_scoped_id_("date", obj);
-      parent_->send_single_telemetry_(scoped_id, value);
-      parent_->send_single_client_attribute_(scoped_id, value);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, value, device_id);
+      parent_->send_single_client_attribute_(scoped_id, value, device_id);
       return true;
     }
 #endif
@@ -652,8 +816,9 @@ protected:
           str_sprintf("%02d:%02d:%02d", obj->hour, obj->minute, obj->second);
       std::string scoped_id =
           parent_->get_domain_scoped_id_("time", obj);
-      parent_->send_single_telemetry_(scoped_id, value);
-      parent_->send_single_client_attribute_(scoped_id, value);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, value, device_id);
+      parent_->send_single_client_attribute_(scoped_id, value, device_id);
       return true;
     }
 #endif
@@ -667,8 +832,9 @@ protected:
                       obj->day, obj->hour, obj->minute, obj->second);
       std::string scoped_id =
           parent_->get_domain_scoped_id_("datetime", obj);
-      parent_->send_single_telemetry_(scoped_id, value);
-      parent_->send_single_client_attribute_(scoped_id, value);
+      uint32_t device_id = parent_->entity_device_id_(obj);
+      parent_->send_single_telemetry_(scoped_id, value, device_id);
+      parent_->send_single_client_attribute_(scoped_id, value, device_id);
       return true;
     }
 #endif
@@ -726,7 +892,7 @@ protected:
       bool update_available = obj->state == update::UPDATE_STATE_AVAILABLE;
       parent_->send_single_telemetry_(
           parent_->get_domain_scoped_id_("update", obj),
-          update_available ? 1.0f : 0.0f);
+          update_available ? 1.0f : 0.0f, parent_->entity_device_id_(obj));
       return true;
     }
 #endif
@@ -740,7 +906,7 @@ protected:
                obj->get_object_id_to(buf).c_str(), obj->state.c_str());
       parent_->send_single_telemetry_(
           parent_->get_domain_scoped_id_("text_sensor", obj),
-          obj->state);
+          obj->state, parent_->entity_device_id_(obj));
       return true;
     }
 #endif

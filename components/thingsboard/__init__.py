@@ -33,6 +33,8 @@ CONF_CLAIM_SECRET_KEY = "claim_secret_key"
 CONF_CLAIM_DURATION_MS = "claim_duration_ms"
 CONF_OFFLINE_QUEUE_MAX = "offline_queue_max"
 CONF_USE_CLIENT_TIMESTAMPS = "use_client_timestamps"
+CONF_COMMAND_PREFIX = "command_prefix"
+CONF_STATE_PREFIX = "state_prefix"
 
 
 CONFIG_SCHEMA = cv.All(
@@ -65,6 +67,15 @@ CONFIG_SCHEMA = cv.All(
             # disconnect carry the original capture time instead of TB's
             # server-receive time.
             cv.Optional(CONF_USE_CLIENT_TIMESTAMPS, default=False): cv.boolean,
+            # Inbound command-attribute prefix. Shared attributes with keys
+            # `<command_prefix><domain>.<object_id>` are dispatched into the
+            # matching domain handler. Default `"set."`.
+            cv.Optional(CONF_COMMAND_PREFIX, default="set."): cv.string,
+            # Outbound client-attribute (state echo) prefix. Default `""`
+            # preserves historical behaviour (state echoes share scoped ids
+            # with telemetry). Set to e.g. `"state."` to namespace echoes
+            # separately on TB.
+            cv.Optional(CONF_STATE_PREFIX, default=""): cv.string,
             cv.Optional(
                 CONF_TIMEOUT, default="10s"
             ): cv.positive_time_period_milliseconds,
@@ -142,6 +153,8 @@ async def to_code(config):
         cg.add(var.set_periodic_sync_interval(config[CONF_PERIODIC_SYNC_INTERVAL]))
     cg.add(var.set_offline_queue_max(config[CONF_OFFLINE_QUEUE_MAX]))
     cg.add(var.set_use_client_timestamps(config[CONF_USE_CLIENT_TIMESTAMPS]))
+    cg.add(var.set_command_prefix(config[CONF_COMMAND_PREFIX]))
+    cg.add(var.set_state_prefix(config[CONF_STATE_PREFIX]))
 
     if CONF_ON_CONNECT in config:
         await automation.build_automation(
@@ -210,6 +223,7 @@ CONF_TOKEN = "token"
             cv.Required(CONF_DATA): cv.templatable(cv.string),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_send_telemetry_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -230,6 +244,7 @@ async def thingsboard_send_telemetry_to_code(config, action_id, template_arg, ar
             cv.Required(CONF_DATA): cv.templatable(cv.string),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_send_attributes_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -249,6 +264,7 @@ async def thingsboard_send_attributes_to_code(config, action_id, template_arg, a
             cv.GenerateID(): cv.use_id(ThingsBoardComponent),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_clear_token_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -265,6 +281,7 @@ async def thingsboard_clear_token_to_code(config, action_id, template_arg, args)
             cv.Required(CONF_TOKEN): cv.templatable(cv.string),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_set_token_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -286,6 +303,7 @@ async def thingsboard_set_token_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_claim_device_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -315,6 +333,7 @@ async def thingsboard_claim_device_to_code(config, action_id, template_arg, args
             cv.Optional(CONF_PARAMS, default="{}"): cv.templatable(cv.string),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_send_rpc_request_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -338,6 +357,7 @@ async def thingsboard_send_rpc_request_to_code(config, action_id, template_arg, 
             cv.Required(CONF_KEYS): cv.templatable(cv.string),
         }
     ),
+    synchronous=True,
 )
 async def thingsboard_request_attributes_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)

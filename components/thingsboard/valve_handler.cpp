@@ -3,14 +3,16 @@
 #ifdef USE_VALVE
 
 #include "esphome/core/log.h"
+#include <cmath>
+#include <cstdlib>
 
 namespace esphome {
 namespace thingsboard {
 
 static const char *TAG = "thingsboard.valve";
 
-RpcResult ValveHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) {
-  auto *obj = find_entity(App.get_valves(), entity_id);
+RpcResult ValveHandler::handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id) {
+  auto *obj = find_entity(App.get_valves(), entity_id, device_id);
   if (obj == nullptr) {
     ESP_LOGW(TAG, "Valve not found: %s", entity_id.c_str());
     return {ESP_ERR_NOT_FOUND, ""};
@@ -58,8 +60,15 @@ void ValveHandler::register_shared_attributes(register_fn reg) {
     if (obj->is_internal()) continue;
     char buf[OBJECT_ID_MAX_LEN];
     reg(obj->get_object_id_to(buf), [obj](const std::string &value) {
+      char *end = nullptr;
+      float f = std::strtof(value.c_str(), &end);
+      if (end == value.c_str() || !std::isfinite(f)) {
+        ESP_LOGW(TAG, "Valve %s: ignoring non-numeric value '%s'",
+                 obj->get_object_id().c_str(), value.c_str());
+        return;
+      }
       auto call = obj->make_call();
-      call.set_position(std::stof(value));
+      call.set_position(f);
       call.perform();
     });
   }

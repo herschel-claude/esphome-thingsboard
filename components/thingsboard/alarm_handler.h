@@ -13,7 +13,7 @@ namespace thingsboard {
 class AlarmHandler : public DomainHandler {
  public:
   const char *domain() const override { return "alarm_control_panel"; }
-  RpcResult handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params) override;
+  RpcResult handle_rpc(const std::string &method, const std::string &entity_id, JsonObject params, uint32_t device_id = 0) override;
   void register_shared_attributes(register_fn reg) override;
   size_t entity_count() const override;
   void append_entity_ids(JsonArray arr) const override;
