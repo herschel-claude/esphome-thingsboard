@@ -1,5 +1,12 @@
 #include "thingsboard_mqtt_transport.h"
+// thingsboard_mqtt_ota is an optional sibling component — its header only
+// exists in the build when the user configures it. Guard the include (and the
+// OTA chunk branch below) so thingsboard_mqtt compiles standalone, e.g. with
+// thingsboard_gateway but no OTA. The USE_* define comes from defines.h, which
+// thingsboard_mqtt_transport.h includes first.
+#ifdef USE_THINGSBOARD_MQTT_OTA
 #include "esphome/components/thingsboard_mqtt_ota/thingsboard_mqtt_ota.h"
+#endif
 
 #ifdef USE_ESP32
 
@@ -23,8 +30,43 @@ static const char *const RPC_RESPONSE_TOPIC_PREFIX = "v1/devices/me/rpc/response
 static const char *const RPC_RESPONSE_SUB_TOPIC = "v1/devices/me/rpc/response/+";
 static const char *const RPC_REQUEST_PUBLISH_TOPIC_PREFIX = "v1/devices/me/rpc/request/";
 static const char *const ATTRIBUTE_REQUEST_TOPIC_PREFIX = "v1/devices/me/attributes/request/";
+static const char *const ATTRIBUTE_RESPONSE_TOPIC_PREFIX = "v1/devices/me/attributes/response/";
 static const char *const ATTRIBUTE_RESPONSE_SUB_TOPIC = "v1/devices/me/attributes/response/+";
 static const char *const PROVISION_TOPIC = "/provision";
+
+// ThingsBoard Gateway API topics (MQTT-only). Additive to the device API
+// above: a gateway is still an ordinary device on `v1/devices/me/*` for
+// itself, and uses these to proxy named child devices.
+static const char *const GW_CONNECT_TOPIC = "v1/gateway/connect";
+static const char *const GW_DISCONNECT_TOPIC = "v1/gateway/disconnect";
+static const char *const GW_TELEMETRY_TOPIC = "v1/gateway/telemetry";
+static const char *const GW_ATTRIBUTES_TOPIC = "v1/gateway/attributes";
+static const char *const GW_ATTRIBUTE_REQUEST_TOPIC = "v1/gateway/attributes/request";
+static const char *const GW_ATTRIBUTE_RESPONSE_TOPIC = "v1/gateway/attributes/response";
+static const char *const GW_RPC_TOPIC = "v1/gateway/rpc";
+static const char *const GW_CLAIM_TOPIC = "v1/gateway/claim";
+
+// Coerces a JSON value to the string form the inbound pipelines expect.
+// Scalars pass through as their raw representation; objects/arrays serialise
+// back to their JSON literal so handlers can re-parse them with parse_json
+// (covers e.g. climate.control multi-field setpoints, lighting JSON objects).
+static std::string json_value_to_string(JsonVariantConst v) {
+  if (v.is<const char *>())
+    return v.as<const char *>();
+  if (v.is<bool>())
+    return v.as<bool>() ? "true" : "false";
+  if (v.is<int>())
+    return std::to_string(v.as<int>());
+  if (v.is<float>())
+    return std::to_string(v.as<float>());
+  if (v.is<JsonObjectConst>() || v.is<JsonArrayConst>()) {
+    std::string out;
+    serializeJson(v, out);
+    return out;
+  }
+  if (v.isNull()) return "null";
+  return "unknown";
+}
 
 bool ThingsBoardMQTT::tls_enabled_() const {
   return this->use_x509_ || !this->server_ca_pem_.empty();
@@ -87,7 +129,10 @@ void ThingsBoardMQTT::dispatch_on_loop_(std::function<void()> &&func) {
     func();
     return;
   }
-  App.scheduler.set_timeout(this->parent_, "tb_mqtt_dispatch", 0,
+  // Unique id per dispatch: the numeric-id set_timeout overload only cancels a
+  // pending item with the *same* id, and a fresh id matches nothing -- so every
+  // queued callback survives to run on the loop thread.
+  App.scheduler.set_timeout(this->parent_, ++this->dispatch_id_counter_, 0,
                             std::move(func));
 }
 
@@ -134,6 +179,9 @@ bool ThingsBoardMQTT::connect() {
       mqtt_cfg.network.timeout_ms = 10000;
       mqtt_cfg.session.keepalive = 60;
       mqtt_cfg.buffer.size = 4 * 1024;
+      // The core component owns reconnect cadence (exponential backoff in its
+      // loop()); ESP-MQTT's own fixed-timer auto-reconnect would fight it.
+      mqtt_cfg.network.disable_auto_reconnect = true;
       esp_err_t err = esp_mqtt_set_config(this->mqtt_client_, &mqtt_cfg);
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_mqtt_set_config failed: %s", esp_err_to_name(err));
@@ -151,13 +199,25 @@ bool ThingsBoardMQTT::connect() {
   ESP_LOGI(TAG, "Connecting to ThingsBoard MQTT broker: %s:%d (%s)",
            this->broker_host_.c_str(), this->broker_port_,
            this->tls_enabled_() ? "TLS" : "plaintext");
-  ESP_LOGI(TAG, "Using device token: %s", this->device_token_.c_str());
+  // Token is a bearer credential. Redact at INFO; full value visible at DEBUG.
+  if (this->device_token_.size() >= 4) {
+    ESP_LOGI(TAG, "Using device token: %.4s... (%u chars)",
+             this->device_token_.c_str(),
+             static_cast<unsigned>(this->device_token_.size()));
+  } else {
+    ESP_LOGI(TAG, "Using device token: (%u chars)",
+             static_cast<unsigned>(this->device_token_.size()));
+  }
+  ESP_LOGD(TAG, "Using device token: %s", this->device_token_.c_str());
 
   esp_mqtt_client_config_t mqtt_cfg = {};
   this->apply_broker_address_(mqtt_cfg);
   this->apply_credentials_(mqtt_cfg);
   mqtt_cfg.network.timeout_ms = 10000;
   mqtt_cfg.session.keepalive = 60;
+  // The core component owns reconnect cadence (exponential backoff in its
+  // loop()); ESP-MQTT's own fixed-timer auto-reconnect would fight it.
+  mqtt_cfg.network.disable_auto_reconnect = true;
   // Must fit a full OTA chunk (chunk_size=4096) plus topic+MQTT framing.
   // Smaller buffers cause ESP-MQTT to fragment chunks across events; we reject
   // fragmented chunks rather than reassemble (see MQTT_EVENT_DATA handler).
@@ -261,152 +321,151 @@ bool ThingsBoardMQTT::is_connected() const {
 }
 
 bool ThingsBoardMQTT::publish_telemetry(const std::string &payload) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish telemetry");
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Publishing telemetry (size: %zu bytes)", payload.length());
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, TELEMETRY_TOPIC, 
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish telemetry (size: %zu bytes)", payload.length());
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Published telemetry (msg_id=%d, size: %zu bytes): %s", msg_id, payload.length(), payload.c_str());
-  return true;
+  return this->publish(TELEMETRY_TOPIC, payload);
 }
 
 bool ThingsBoardMQTT::publish_attributes(const std::string &payload) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish attributes");
-    return false;
-  }
-
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, ATTRIBUTES_TOPIC,
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish attributes");
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Published attributes (msg_id=%d): %s", msg_id, payload.c_str());
-  return true;
+  return this->publish(ATTRIBUTES_TOPIC, payload);
 }
 
 bool ThingsBoardMQTT::publish_client_attributes(const std::string &payload) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish client attributes");
-    return false;
-  }
-
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, ATTRIBUTES_TOPIC,
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish client attributes");
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Published client attributes (msg_id=%d): %s", msg_id, payload.c_str());
-  return true;
+  return this->publish(ATTRIBUTES_TOPIC, payload);
 }
 
-bool ThingsBoardMQTT::publish_rpc_response(const std::string &request_id, const std::string &payload) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish RPC response");
-    return false;
-  }
-
-  std::string topic = RPC_RESPONSE_TOPIC_PREFIX + request_id;
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, topic.c_str(), 
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish RPC response to %s", topic.c_str());
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Published RPC response (msg_id=%d) to %s: %s", msg_id, topic.c_str(), payload.c_str());
-  return true;
+bool ThingsBoardMQTT::publish_rpc_response(const std::string &request_id,
+                                           const std::string &payload) {
+  return this->publish(RPC_RESPONSE_TOPIC_PREFIX + request_id, payload);
 }
 
-bool ThingsBoardMQTT::publish_rpc_request(const std::string &request_id, const std::string &method, const std::string &params) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish RPC request");
-    return false;
-  }
-
+bool ThingsBoardMQTT::publish_rpc_request(const std::string &request_id,
+                                          const std::string &method,
+                                          const std::string &params) {
   std::string topic = RPC_REQUEST_PUBLISH_TOPIC_PREFIX + request_id;
-  std::string payload = "{\"method\":\"" + method + "\",\"params\":" + params + "}";
-  
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, topic.c_str(), 
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish RPC request to %s", topic.c_str());
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Published RPC request (msg_id=%d) to %s: %s", msg_id, topic.c_str(), payload.c_str());
-  return true;
+  std::string payload =
+      "{\"method\":\"" + method + "\",\"params\":" + params + "}";
+  return this->publish(topic, payload);
 }
 
-bool ThingsBoardMQTT::publish_attribute_request(const std::string &request_id, const std::string &keys) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish attribute request");
-    return false;
-  }
-
+bool ThingsBoardMQTT::publish_attribute_request(const std::string &request_id,
+                                                 const std::string &keys) {
   // `keys` is already a JSON object per the TBTransport contract
   // (e.g. `{"clientKeys":"a,b","sharedKeys":"c,d"}`); publish verbatim.
-  std::string topic = ATTRIBUTE_REQUEST_TOPIC_PREFIX + request_id;
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, topic.c_str(),
-                                       keys.c_str(), keys.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish attribute request to %s", topic.c_str());
-    return false;
-  }
-
-  ESP_LOGD(TAG, "Published attribute request (msg_id=%d) to %s: %s", msg_id, topic.c_str(), keys.c_str());
-  return true;
+  return this->publish(ATTRIBUTE_REQUEST_TOPIC_PREFIX + request_id, keys);
 }
 
 bool ThingsBoardMQTT::publish_provision_request(const std::string &payload) {
-  if (!is_connected()) {
-    ESP_LOGW(TAG, "Not connected, cannot publish provision request");
-    return false;
-  }
-
-  ESP_LOGD(TAG, "Publishing provisioning request to %s", PROVISION_TOPIC);
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, PROVISION_TOPIC, 
-                                      payload.c_str(), payload.length(), 1, 0);
-  if (msg_id == -1) {
-    ESP_LOGE(TAG, "Failed to publish provisioning request to %s", PROVISION_TOPIC);
-    return false;
-  }
-
-  ESP_LOGD(TAG, "Published provisioning request (msg_id=%d): %s", msg_id, payload.c_str());
-  return true;
+  return this->publish(PROVISION_TOPIC, payload);
 }
 
 bool ThingsBoardMQTT::publish_claim(const std::string &payload) {
-  return this->publish("v1/devices/me/claim", payload, 1, false);
+  return this->publish("v1/devices/me/claim", payload);
 }
 
-bool ThingsBoardMQTT::publish(const std::string &topic, const std::string &payload, uint8_t qos, bool retain) {
+bool ThingsBoardMQTT::publish(const std::string &topic, const std::string &payload) {
   if (!is_connected()) {
     ESP_LOGW(TAG, "Not connected, cannot publish to %s", topic.c_str());
     return false;
   }
 
-  int msg_id = esp_mqtt_client_publish(this->mqtt_client_, topic.c_str(), 
-                                      payload.c_str(), payload.length(), qos, retain ? 1 : 0);
+  int msg_id = esp_mqtt_client_publish(
+      this->mqtt_client_, topic.c_str(), payload.c_str(), payload.length(),
+      this->publish_qos_, this->publish_retain_ ? 1 : 0);
   if (msg_id == -1) {
     ESP_LOGE(TAG, "Failed to publish to %s", topic.c_str());
     return false;
   }
 
-  ESP_LOGV(TAG, "Published to %s (msg_id=%d, qos=%d): %s", topic.c_str(), msg_id, qos, payload.c_str());
+  ESP_LOGV(TAG, "Published to %s (msg_id=%d, qos=%d, retain=%d): %s",
+           topic.c_str(), msg_id, this->publish_qos_,
+           this->publish_retain_ ? 1 : 0, payload.c_str());
   return true;
+}
+
+// --- TBGatewayPublisher: v1/gateway/* outbound surface --------------------
+// Each method formats the device-name-keyed envelope the TB Gateway API
+// expects and publishes through the existing publish() helper. Caller-supplied
+// `payload` strings are spliced verbatim via ArduinoJson's serialized().
+
+bool ThingsBoardMQTT::gw_connect(const std::string &device_name,
+                                 const std::string &device_type) {
+  std::string payload = json::build_json([&](JsonObject root) {
+    root["device"] = device_name;
+    if (!device_type.empty())
+      root["type"] = device_type;
+  });
+  return this->publish(GW_CONNECT_TOPIC, payload);
+}
+
+bool ThingsBoardMQTT::gw_disconnect(const std::string &device_name) {
+  std::string payload = json::build_json(
+      [&](JsonObject root) { root["device"] = device_name; });
+  return this->publish(GW_DISCONNECT_TOPIC, payload);
+}
+
+bool ThingsBoardMQTT::gw_publish_telemetry(const std::string &device_name,
+                                           const std::string &payload) {
+  // TB Gateway API: {"<device>": [<value-object>, ...]}. The per-device value
+  // MUST be a JSON array -- TB's AbstractGatewaySessionHandler.onDeviceTelemetryJson
+  // filters out non-array entries and then throws IllegalArgumentException
+  // ("Devices telemetry message is empty"), which closes the MQTT channel.
+  // The caller (gateway component flush_gw_batch_) hands us a plain values
+  // object {key: value, ...}; wrap it in a single-element array here so the
+  // gateway component stays agnostic to TB's wire shape.
+  std::string wrapped_array = "[" + payload + "]";
+  std::string wrapped = json::build_json([&](JsonObject root) {
+    root[device_name] = serialized(wrapped_array);
+  });
+  return this->publish(GW_TELEMETRY_TOPIC, wrapped);
+}
+
+bool ThingsBoardMQTT::gw_publish_attributes(const std::string &device_name,
+                                            const std::string &payload) {
+  std::string wrapped = json::build_json(
+      [&](JsonObject root) { root[device_name] = serialized(payload); });
+  return this->publish(GW_ATTRIBUTES_TOPIC, wrapped);
+}
+
+bool ThingsBoardMQTT::gw_request_attributes(const std::string &device_name,
+                                            const std::string &request_id,
+                                            const std::string &keys,
+                                            bool client_scope) {
+  std::string payload = json::build_json([&](JsonObject root) {
+    root["id"] = serialized(request_id);
+    root["device"] = device_name;
+    root[client_scope ? "client" : "shared"] = keys;
+  });
+  return this->publish(GW_ATTRIBUTE_REQUEST_TOPIC, payload);
+}
+
+bool ThingsBoardMQTT::gw_publish_rpc_response(const std::string &device_name,
+                                              const std::string &request_id,
+                                              const std::string &payload) {
+  // Gateway RPC request and response share GW_RPC_TOPIC, matched by `id`.
+  std::string wrapped = json::build_json([&](JsonObject root) {
+    root["device"] = device_name;
+    root["id"] = serialized(request_id);
+    root["data"] = serialized(payload);
+  });
+  return this->publish(GW_RPC_TOPIC, wrapped);
+}
+
+bool ThingsBoardMQTT::gw_publish_claim(const std::string &device_name,
+                                       const std::string &payload) {
+  std::string wrapped = json::build_json(
+      [&](JsonObject root) { root[device_name] = serialized(payload); });
+  return this->publish(GW_CLAIM_TOPIC, wrapped);
+}
+
+void ThingsBoardMQTT::subscribe_gateway_topics() {
+  if (this->gateway_handler_ == nullptr || this->gateway_topics_subscribed_)
+    return;
+  // Inbound gateway streams: shared-attribute pushes, attribute-request
+  // responses, and RPC (request + response share one topic, matched by id).
+  this->subscribe_raw(GW_ATTRIBUTES_TOPIC, 1);
+  this->subscribe_raw(GW_ATTRIBUTE_RESPONSE_TOPIC, 1);
+  this->subscribe_raw(GW_RPC_TOPIC, 1);
+  this->gateway_topics_subscribed_ = true;
+  ESP_LOGD(TAG, "Subscribed to v1/gateway/* topics");
 }
 
 void ThingsBoardMQTT::subscribe_rpc_requests() {
@@ -528,6 +587,7 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       this->rpc_responses_subscribed_ = false;
       this->shared_attributes_subscribed_ = false;
       this->attribute_responses_subscribed_ = false;
+      this->gateway_topics_subscribed_ = false;
 
       // Subscribe before notifying the core: TCP ordering ensures these
       // SUBSCRIBE packets reach TB before any publish from on_connected_,
@@ -538,11 +598,17 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         this->subscribe_rpc_responses();
         this->subscribe_shared_attributes();
         this->subscribe_attribute_responses();
+        // No-op unless a thingsboard_gateway component registered a handler.
+        this->subscribe_gateway_topics();
       }
 
       if (this->on_connect_callback_ || this->on_connected_) {
         auto on_connect = this->on_connect_callback_;
         auto on_connected = this->on_connected_;
+        // dispatch_on_loop_ gives each call a unique scheduler id, so this
+        // connect dispatch can never be cancelled by a same-tick disconnect or
+        // inbound parse before loop() runs it (which would lose the gateway
+        // replay, initial-state sync, and connect trigger).
         this->dispatch_on_loop_([on_connect, on_connected]() {
           if (on_connect) on_connect();
           if (on_connected) on_connected();
@@ -557,6 +623,7 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       this->rpc_responses_subscribed_ = false;
       this->shared_attributes_subscribed_ = false;
       this->attribute_responses_subscribed_ = false;
+      this->gateway_topics_subscribed_ = false;
       if (this->on_disconnect_callback_ || this->on_disconnected_) {
         auto on_disconnect = this->on_disconnect_callback_;
         auto on_disconnected = this->on_disconnected_;
@@ -591,6 +658,9 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         // route them before the null-terminated payload copy used by JSON paths.
         // ESP-MQTT splits messages larger than buffer.size across events; earlier
         // fragments are not preserved, so we only dispatch when the payload is whole.
+        // Guarded: ota_handler_ is only ever non-null when thingsboard_mqtt_ota
+        // is configured, and on_chunk_received() needs that component's header.
+#ifdef USE_THINGSBOARD_MQTT_OTA
         if (strncmp(topic, "v2/fw/response/", 15) == 0) {
           if (this->ota_handler_ != nullptr &&
               event->current_data_offset + event->data_len ==
@@ -621,6 +691,7 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
           }
           break;
         }
+#endif  // USE_THINGSBOARD_MQTT_OTA
 
         char payload[event->data_len + 1];
         strncpy(payload, event->data, event->data_len);
@@ -634,13 +705,18 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
             this->dispatch_on_loop_(
                 [cb, resp]() { cb(resp); });
           }
-        } else if (strncmp(topic, "v1/devices/me/rpc/request/", 26) == 0) {
+        } else if (strncmp(topic, "v1/gateway/", 11) == 0) {
+          this->parse_gateway_message(topic, payload);
+        } else if (strncmp(topic, RPC_REQUEST_PUBLISH_TOPIC_PREFIX,
+                            strlen(RPC_REQUEST_PUBLISH_TOPIC_PREFIX)) == 0) {
           this->parse_rpc_request(topic, payload);
-        } else if (strncmp(topic, "v1/devices/me/rpc/response/", 28) == 0) {
+        } else if (strncmp(topic, RPC_RESPONSE_TOPIC_PREFIX,
+                            strlen(RPC_RESPONSE_TOPIC_PREFIX)) == 0) {
           this->parse_rpc_response(topic, payload);
-        } else if (strcmp(topic, "v1/devices/me/attributes") == 0) {
+        } else if (strcmp(topic, SHARED_ATTRIBUTES_TOPIC) == 0) {
           this->parse_shared_attributes(topic, payload);
-        } else if (strncmp(topic, "v1/devices/me/attributes/response/", 36) == 0) {
+        } else if (strncmp(topic, ATTRIBUTE_RESPONSE_TOPIC_PREFIX,
+                            strlen(ATTRIBUTE_RESPONSE_TOPIC_PREFIX)) == 0) {
           this->parse_attribute_response(topic, payload);
         }
       }
@@ -650,6 +726,20 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     case MQTT_EVENT_ERROR:
       ESP_LOGE(TAG, "MQTT error occurred");
       this->handle_mqtt_error(event);
+      break;
+
+    // ESP-MQTT fires this before each TCP connect attempt (id 7 in
+    // esp_mqtt_event_id_t). Nothing to do -- explicit case so it doesn't
+    // appear as an "unhandled event" warning every reconnect.
+    case MQTT_EVENT_BEFORE_CONNECT:
+      break;
+
+    // Fires when the client deletes a not-yet-published message because the
+    // outbox filled up (only set when CONFIG_MQTT_REPORT_DELETED_MESSAGES is
+    // enabled and skip_publish is not set). We don't enable that config so
+    // this is effectively never reached; declared explicitly anyway.
+    case MQTT_EVENT_DELETED:
+      ESP_LOGW(TAG, "MQTT outbox dropped a message before publish");
       break;
 
     default:
@@ -732,24 +822,7 @@ void ThingsBoardMQTT::parse_shared_attributes(const char *topic, const char *pay
   json::parse_json(payload, [&attributes](JsonObject root) -> bool {
     for (JsonPair p : root) {
       std::string key = p.key().c_str();
-      std::string value;
-
-      if (p.value().is<const char*>()) {
-        value = p.value().as<const char*>();
-      } else if (p.value().is<bool>()) {
-        value = p.value().as<bool>() ? "true" : "false";
-      } else if (p.value().is<int>()) {
-        value = std::to_string(p.value().as<int>());
-      } else if (p.value().is<float>()) {
-        value = std::to_string(p.value().as<float>());
-      } else {
-        if (p.value().is<const char*>()) {
-          value = p.value().as<const char*>();
-        } else {
-          value = "unknown";
-        }
-      }
-
+      std::string value = json_value_to_string(p.value());
       attributes[key] = value;
       ESP_LOGV(TAG, "Shared attribute: %s = %s", key.c_str(), value.c_str());
     }
@@ -782,41 +855,15 @@ void ThingsBoardMQTT::parse_attribute_response(const char *topic, const char *pa
     if (root["shared"].is<JsonObject>()) {
       JsonObject shared = root["shared"];
       for (JsonPair p : shared) {
-        std::string key = p.key().c_str();
-        std::string value;
-        if (p.value().is<const char*>()) {
-          value = p.value().as<const char*>();
-        } else if (p.value().is<bool>()) {
-          value = p.value().as<bool>() ? "true" : "false";
-        } else if (p.value().is<int>()) {
-          value = std::to_string(p.value().as<int>());
-        } else if (p.value().is<float>()) {
-          value = std::to_string(p.value().as<float>());
-        } else {
-          value = "unknown";
-        }
-        attributes[key] = value;
+        attributes[p.key().c_str()] = json_value_to_string(p.value());
       }
     }
     // Flat (non-nested) attribute responses.
     for (JsonPair p : root) {
-      if (strcmp(p.key().c_str(), "shared") != 0 && 
-          strcmp(p.key().c_str(), "client") != 0 && 
+      if (strcmp(p.key().c_str(), "shared") != 0 &&
+          strcmp(p.key().c_str(), "client") != 0 &&
           strcmp(p.key().c_str(), "server") != 0) {
-        std::string key = p.key().c_str();
-        std::string value;
-        if (p.value().is<const char*>()) {
-          value = p.value().as<const char*>();
-        } else if (p.value().is<bool>()) {
-          value = p.value().as<bool>() ? "true" : "false";
-        } else if (p.value().is<int>()) {
-          value = std::to_string(p.value().as<int>());
-        } else if (p.value().is<float>()) {
-          value = std::to_string(p.value().as<float>());
-        } else {
-          value = "unknown";
-        }
-        attributes[key] = value;
+        attributes[p.key().c_str()] = json_value_to_string(p.value());
       }
     }
     return true;
@@ -827,6 +874,117 @@ void ThingsBoardMQTT::parse_attribute_response(const char *topic, const char *pa
     std::string rid = request_id;
     this->dispatch_on_loop_([cb, rid, attributes]() { cb(rid, attributes); });
   }
+}
+
+// Decodes the device-name-keyed envelopes the TB Gateway API delivers on the
+// gateway's own MQTT session and forwards each event to the registered
+// TBGatewayTransport. Runs on the ESP-MQTT task; every handler call is hopped
+// onto the main loop via dispatch_on_loop_, which gives each dispatch a unique
+// id so a burst of gateway messages in one loop tick is not coalesced.
+void ThingsBoardMQTT::parse_gateway_message(const char *topic,
+                                            const char *payload) {
+  if (this->gateway_handler_ == nullptr)
+    return;
+  auto *handler = this->gateway_handler_;
+
+  if (strcmp(topic, GW_RPC_TOPIC) == 0) {
+    // Request envelope:
+    //   {"device":"<name>","data":{"id":<int>,"method":"<m>","params":<obj>}}
+    json::parse_json(payload, [this, handler](JsonObject root) -> bool {
+      if (!root["device"].is<std::string>() ||
+          !root["data"].is<JsonObject>()) {
+        ESP_LOGW(TAG, "Malformed gateway RPC payload");
+        return false;
+      }
+      std::string device = root["device"].as<std::string>();
+      JsonObject data = root["data"];
+      // `id` is an integer in the gateway RPC envelope; stringify it so the
+      // rest of the pipeline can treat it like a device-API request id.
+      std::string request_id;
+      if (data["id"].is<int>())
+        request_id = std::to_string(data["id"].as<int>());
+      else if (data["id"].is<std::string>())
+        request_id = data["id"].as<std::string>();
+      std::string method;
+      if (data["method"].is<std::string>())
+        method = data["method"].as<std::string>();
+      std::string params;
+      if (data["params"].is<JsonObject>()) {
+        JsonObject params_obj = data["params"];
+        params = json::build_json([&params_obj](JsonObject obj) {
+          for (JsonPair p : params_obj) obj[p.key()] = p.value();
+        });
+      }
+      ESP_LOGD(TAG, "Gateway RPC: device=%s id=%s method=%s", device.c_str(),
+               request_id.c_str(), method.c_str());
+      this->dispatch_on_loop_(
+          [handler, device, request_id, method, params]() {
+            handler->on_gateway_rpc_request(device, request_id, method, params);
+          });
+      return true;
+    });
+    return;
+  }
+
+  if (strcmp(topic, GW_ATTRIBUTES_TOPIC) == 0) {
+    // Server push: {"device":"<name>","data":{<k>:<v>,...}}.
+    json::parse_json(payload, [this, handler](JsonObject root) -> bool {
+      if (!root["device"].is<std::string>() ||
+          !root["data"].is<JsonObject>()) {
+        ESP_LOGW(TAG, "Malformed gateway shared-attributes payload");
+        return false;
+      }
+      std::string device = root["device"].as<std::string>();
+      std::map<std::string, std::string> attributes;
+      for (JsonPair p : root["data"].as<JsonObject>())
+        attributes[p.key().c_str()] = json_value_to_string(p.value());
+      if (!attributes.empty()) {
+        this->dispatch_on_loop_(
+            [handler, device, attributes]() {
+              handler->on_gateway_shared_attributes(device, attributes);
+            });
+      }
+      return true;
+    });
+    return;
+  }
+
+  if (strcmp(topic, GW_ATTRIBUTE_RESPONSE_TOPIC) == 0) {
+    // Response to gw_request_attributes. TB versions differ on the container
+    // key (`values` / `data` / `client` / `shared`), so collect entries from
+    // any object-valued field that is not `id` or `device`.
+    json::parse_json(payload, [this, handler](JsonObject root) -> bool {
+      if (!root["device"].is<std::string>()) {
+        ESP_LOGW(TAG, "Malformed gateway attribute-response payload");
+        return false;
+      }
+      std::string device = root["device"].as<std::string>();
+      std::string request_id;
+      if (root["id"].is<int>())
+        request_id = std::to_string(root["id"].as<int>());
+      else if (root["id"].is<std::string>())
+        request_id = root["id"].as<std::string>();
+      std::map<std::string, std::string> attributes;
+      for (JsonPair field : root) {
+        const char *fkey = field.key().c_str();
+        if (strcmp(fkey, "id") == 0 || strcmp(fkey, "device") == 0)
+          continue;
+        if (field.value().is<JsonObject>()) {
+          for (JsonPair p : field.value().as<JsonObject>())
+            attributes[p.key().c_str()] = json_value_to_string(p.value());
+        }
+      }
+      this->dispatch_on_loop_(
+          [handler, device, request_id, attributes]() {
+            handler->on_gateway_attribute_response(device, request_id,
+                                                   attributes);
+          });
+      return true;
+    });
+    return;
+  }
+
+  ESP_LOGD(TAG, "Unhandled v1/gateway/* topic: %s", topic);
 }
 
 void ThingsBoardMQTT::handle_mqtt_error(esp_mqtt_event_handle_t event) {

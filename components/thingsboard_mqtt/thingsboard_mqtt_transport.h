@@ -6,10 +6,8 @@
 
 #include <string>
 #include <functional>
-#include <map>
 #include <mqtt_client.h>
 #include "esphome/core/component.h"
-#include "esphome/core/log.h"
 #include "esphome/components/thingsboard/transport.h"
 
 namespace esphome {
@@ -19,7 +17,7 @@ class ThingsBoardMqttOtaComponent;
 
 namespace thingsboard {
 
-class ThingsBoardMQTT : public TBTransport {
+class ThingsBoardMQTT : public TBTransport, public TBGatewayPublisher {
  public:
   ThingsBoardMQTT();
   ~ThingsBoardMQTT() override;
@@ -69,7 +67,17 @@ class ThingsBoardMQTT : public TBTransport {
   bool publish_attribute_request(const std::string &request_id, const std::string &keys) override;
   bool publish_provision_request(const std::string &payload) override; // Publish to /provision topic
   bool publish_claim(const std::string &payload) override;              // Publish to v1/devices/me/claim
-  bool publish(const std::string &topic, const std::string &payload, uint8_t qos = 1, bool retain = false);
+  // Publishes via the configured publish_qos_ / publish_retain_. Inbound topic
+  // subscriptions still use QoS 1 unconditionally (see subscribe_raw).
+  bool publish(const std::string &topic, const std::string &payload);
+
+  // Default QoS + retain applied to every outbound TB publish (device API,
+  // gateway API, provisioning, claim). The publish() helper still accepts
+  // explicit overrides for callers that need a specific value.
+  void set_publish_qos(uint8_t qos) { this->publish_qos_ = qos; }
+  void set_publish_retain(bool retain) { this->publish_retain_ = retain; }
+  uint8_t get_publish_qos() const { return this->publish_qos_; }
+  bool get_publish_retain() const { return this->publish_retain_; }
   void subscribe_rpc_requests();
   void subscribe_rpc_responses(); // For client-side RPC responses
   void subscribe_shared_attributes();
@@ -87,6 +95,34 @@ class ThingsBoardMQTT : public TBTransport {
     this->ota_handler_ = h;
   }
 
+  // TBGatewayPublisher overrides — `v1/gateway/*` outbound surface. See
+  // thingsboard_mqtt_transport.cpp.
+  bool gw_connect(const std::string &device_name,
+                  const std::string &device_type = "") override;
+  bool gw_disconnect(const std::string &device_name) override;
+  bool gw_publish_telemetry(const std::string &device_name,
+                            const std::string &payload) override;
+  bool gw_publish_attributes(const std::string &device_name,
+                             const std::string &payload) override;
+  bool gw_request_attributes(const std::string &device_name,
+                             const std::string &request_id,
+                             const std::string &keys,
+                             bool client_scope) override;
+  bool gw_publish_rpc_response(const std::string &device_name,
+                               const std::string &request_id,
+                               const std::string &payload) override;
+  bool gw_publish_claim(const std::string &device_name,
+                        const std::string &payload) override;
+
+  // Subscribes the `v1/gateway/*` inbound topics. No-op unless a gateway
+  // handler is registered. Called from MQTT_EVENT_CONNECTED alongside the
+  // existing subscribe_* calls.
+  void subscribe_gateway_topics();
+
+  // Registered by a thingsboard_gateway component. Typed against the abstract
+  // TBGatewayTransport interface so this transport needs no gateway header.
+  void set_gateway_handler(TBGatewayTransport *h) { this->gateway_handler_ = h; }
+
   void loop();
 
  private:
@@ -97,11 +133,20 @@ class ThingsBoardMQTT : public TBTransport {
   void parse_rpc_response(const char *topic, const char *payload);
   void parse_shared_attributes(const char *topic, const char *payload);
   void parse_attribute_response(const char *topic, const char *payload);
+  // Decodes a `v1/gateway/*` inbound envelope and forwards it to the
+  // registered TBGatewayTransport. No-op when no gateway handler is set.
+  void parse_gateway_message(const char *topic, const char *payload);
 
   // Schedules `func` for the next main-loop tick via App.scheduler. Used to
-  // hop user-callback dispatch off the ESP-MQTT event task. Everything
-  // downstream of the callback assumes the ESPHome loop thread.
+  // hop user-callback dispatch off the ESP-MQTT event task: everything
+  // downstream of the callback assumes the ESPHome loop thread. Each call gets
+  // a unique scheduler id from dispatch_id_counter_ so dispatches never
+  // coalesce -- a named slot is cancel-and-replace, which would silently drop
+  // an inbound message (or a connect/disconnect event) whenever two land in
+  // the same loop tick. Called only from the ESP-MQTT task, so the counter
+  // needs no synchronisation.
   void dispatch_on_loop_(std::function<void()> &&func);
+  uint32_t dispatch_id_counter_{0};
 
   // True when either client X.509 auth or a server CA pin is configured. Drives
   // the TCP-vs-SSL transport selection passed into ESP-MQTT.
@@ -116,6 +161,13 @@ class ThingsBoardMQTT : public TBTransport {
   std::string device_token_;
   std::string client_id_;
   std::string username_; // For provisioning (set to "provision")
+
+  // QoS 1 is the TB-recommended default (at-least-once); QoS 2 is overkill and
+  // adds round-trips, QoS 0 drops on flaky links. Retain is false by default --
+  // TB doesn't read retained messages on these topics, so retaining only
+  // delays cleanup if a broker is moved between tenants.
+  uint8_t publish_qos_{1};
+  bool publish_retain_{false};
 
   esp_mqtt_client_handle_t mqtt_client_{nullptr};
   bool connected_{false};
@@ -139,10 +191,14 @@ class ThingsBoardMQTT : public TBTransport {
 
   thingsboard_mqtt_ota::ThingsBoardMqttOtaComponent *ota_handler_{nullptr};
 
+  // Non-owning; set by a thingsboard_gateway component, null otherwise.
+  TBGatewayTransport *gateway_handler_{nullptr};
+
   bool rpc_requests_subscribed_{false};
   bool rpc_responses_subscribed_{false};
   bool shared_attributes_subscribed_{false};
   bool attribute_responses_subscribed_{false};
+  bool gateway_topics_subscribed_{false};
 };
 
 }  // namespace thingsboard

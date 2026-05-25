@@ -2,7 +2,6 @@
 
 #include "esphome/core/defines.h"
 
-#include <functional>
 #include <map>
 #include <queue>
 #include <string>
@@ -10,7 +9,6 @@
 #include "esphome/components/http_request/http_request.h"
 #include "esphome/components/thingsboard/transport.h"
 #include "esphome/core/component.h"
-#include "esphome/core/log.h"
 
 #ifdef USE_ESP32
 #include "freertos/FreeRTOS.h"

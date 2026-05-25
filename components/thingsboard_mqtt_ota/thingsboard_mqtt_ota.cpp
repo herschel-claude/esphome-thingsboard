@@ -113,7 +113,7 @@ void ThingsBoardMqttOtaComponent::request_chunk_(uint32_t chunk_idx) {
   std::string payload = std::to_string(this->chunk_size_);
   ESP_LOGV(TAG, "Requesting chunk %u (topic=%s, size=%zu)", chunk_idx,
            topic.c_str(), this->chunk_size_);
-  this->transport_->publish(topic, payload, /*qos=*/1, /*retain=*/false);
+  this->transport_->publish(topic, payload);
 }
 
 void ThingsBoardMqttOtaComponent::on_chunk_received(uint32_t request_id, uint32_t chunk_idx,

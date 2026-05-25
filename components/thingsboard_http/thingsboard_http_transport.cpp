@@ -389,6 +389,11 @@ void ThingsBoardHttpTransport::worker_handle_out_(const OutMsg &msg) {
               v = std::to_string(p.value().as<int>());
             else if (p.value().is<float>())
               v = std::to_string(p.value().as<float>());
+            else if (p.value().is<JsonObjectConst>() ||
+                     p.value().is<JsonArrayConst>())
+              serializeJson(p.value(), v);
+            else if (p.value().isNull())
+              v = "null";
             attrs[k] = v;
           }
         };

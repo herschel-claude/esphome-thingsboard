@@ -23,6 +23,8 @@ DEPENDENCIES = ["wifi", "thingsboard"]
 
 CONF_THINGSBOARD_ID = "thingsboard_id"
 CONF_DEVICE_TOKEN = "device_token"
+CONF_QOS = "qos"
+CONF_RETAIN = "retain"
 CONF_PROVISIONING = "provisioning"
 CONF_PROVISIONING_KEY = "key"
 CONF_PROVISIONING_SECRET = "secret"
@@ -81,6 +83,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_BROKER): cv.string,
             cv.Optional(CONF_PORT): cv.port,
             cv.Optional(CONF_DEVICE_TOKEN): cv.string,
+            # MQTT publish QoS / retain. Default QoS 1 (TB-recommended,
+            # at-least-once); retain is rarely useful with TB and defaults off.
+            cv.Optional(CONF_QOS, default=1): cv.one_of(0, 1, 2, int=True),
+            cv.Optional(CONF_RETAIN, default=False): cv.boolean,
             cv.Optional(CONF_PROVISIONING): PROVISIONING_SCHEMA,
             cv.Optional(CONF_CREDENTIALS): _credentials_schema(allow_token=False),
             # Optional server-CA pin. Set to enable TLS without mTLS (paired
@@ -118,6 +124,8 @@ async def to_code(config):
     if port is None:
         port = 8883 if _tls_configured(config) else 1883
     cg.add(tb.set_mqtt_port(port))
+    cg.add(tb.set_mqtt_publish_qos(config[CONF_QOS]))
+    cg.add(tb.set_mqtt_publish_retain(config[CONF_RETAIN]))
 
     if CONF_SERVER_CA_PEM in config:
         cg.add(tb.set_mqtt_server_ca(config[CONF_SERVER_CA_PEM]))

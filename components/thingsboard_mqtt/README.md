@@ -20,6 +20,9 @@ thingsboard_mqtt:
   # port: 8883            # optional: defaults to 8883 when TLS material
                           # below is present, 1883 otherwise.
   device_token: !secret tb_device_token # optional if `provisioning:` set
+  # qos: 1                # default 1 (TB-recommended at-least-once); 0/2 also accepted.
+  # retain: false         # default false. Retained TB topics are rarely useful,
+                          # so leave off unless your broker pipeline requires it.
   # Optional TLS material. `server_ca_pem` enables TLS with ACCESS_TOKEN or
   # MQTT_BASIC auth; X509_CERTIFICATE credentials require both
   # certificate_pem and private_key_pem. See the top-level README for the
@@ -54,10 +57,32 @@ thingsboard_mqtt:
 | Provisioning, `X509_CERTIFICATE`  | payload wired | `hash` (cert PEM)                              |
 | OTA over MQTT (`v2/fw/*`)         | live          | chunked binary, see `../thingsboard_mqtt_ota/` |
 | SOTA (software updates)           | unsupported   |                                                |
-| Gateway protocol                  | out-of-scope  | device firmware, not a gateway                 |
+| Gateway protocol (`v1/gateway/*`) | live          | opt-in, see `../thingsboard_gateway/`          |
 | Auth, access token                | live          | `username = $TOKEN` in CONNECT                 |
 | Auth, X.509 mTLS                  | live          | `set_client_certificate` + `set_server_ca`     |
 | Auth, `MQTT_BASIC`                | live          | `set_basic_credentials`                        |
+
+## Gateway API topics
+
+When a [`thingsboard_gateway`](../thingsboard_gateway/) component is present the
+transport also speaks the `v1/gateway/*` topic family over the same MQTT
+connection. These are handled by `ThingsBoardMQTT` but driven entirely by the
+gateway component; plain device firmware never touches them.
+
+| Topic                          | Direction | Purpose                                          |
+| ------------------------------ | --------- | ------------------------------------------------ |
+| `v1/gateway/connect`           | publish   | register / link a child device by name          |
+| `v1/gateway/disconnect`        | publish   | unlink a child device                            |
+| `v1/gateway/telemetry`         | publish   | per-child telemetry, name-keyed envelope         |
+| `v1/gateway/attributes`        | publish   | per-child client-attribute upload                |
+| `v1/gateway/attributes/request`| publish   | request a child's shared/client attributes       |
+| `v1/gateway/rpc`               | both      | inbound child RPC request / outbound response    |
+| `v1/gateway/attributes`        | subscribe | server-pushed shared attributes for a child      |
+| `v1/gateway/attributes/response`| subscribe| reply to an attribute request                    |
+
+The `gateway_device_renamed` / `gateway_device_deleted` service RPCs arrive on
+the ordinary device-API RPC topic (`v1/devices/me/rpc/request/+`) and the core
+component forwards them to the gateway component.
 
 ## Credential rotation
 
