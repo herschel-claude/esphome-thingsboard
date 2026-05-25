@@ -1,0 +1,131 @@
+# Compile-test config for the thingsboard_gateway component.
+# Exercises the codegen + registration-handshake path, the A-layer surface
+# (devices: list, per-child + global triggers, child_* actions), AND the
+# B-layer: an `esphome: devices:` block + `auto_map_sub_devices: true` + a
+# sub-device-assigned sensor force USE_DEVICES on, so the device-aware
+# telemetry/RPC routing code compiles in (not just out). Not intended to run
+# against a real broker.
+
+esphome:
+  name: tb-gateway-test
+  # B-layer: two ESPHome sub-devices. auto_map_sub_devices registers each as a
+  # TB gateway child; entities tagged with their device_id route through
+  # v1/gateway/* keyed by the sub-device name.
+  devices:
+    - id: sub_relay_1
+      name: "Relay 1"
+    - id: sub_climate
+      name: "Climate Sensors"
+  on_boot:
+    then:
+      # A-layer outbound actions: a user lambda would normally marshal data
+      # from a local bus (BLE/Modbus/UART) into these.
+      - thingsboard_gateway.child_connect:
+          device_name: "sensor-hub-1"
+          device_type: "Generic Sensor"
+      - thingsboard_gateway.child_send_telemetry:
+          device_name: "sensor-hub-1"
+          data: !lambda 'return "{\"temperature\":21.5,\"humidity\":60}";'
+      - thingsboard_gateway.child_send_attributes:
+          device_name: "sensor-hub-1"
+          data: '{"firmware":"1.0.0"}'
+      - thingsboard_gateway.child_request_attributes:
+          device_name: "sensor-hub-1"
+          request_id: "1"
+          keys: "targetTemp"
+          client_scope: false
+      - thingsboard_gateway.child_disconnect:
+          device_name: "sensor-hub-1"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components:
+      - thingsboard
+      - thingsboard_mqtt
+      - thingsboard_gateway
+
+logger:
+
+wifi:
+  ssid: "test"
+  password: "testtesttest"
+
+# B-layer proof: entities assigned to a sub-device. Their on_*_update and
+# initial-state telemetry route through the gateway child of the same name
+# instead of the device-API batch. A switch on sub_relay_1 also makes the
+# B-layer RPC path (handle_child_rpc -> control iterator, device-id-scoped)
+# reachable for "Relay 1".
+sensor:
+  - platform: template
+    name: "Sub Temperature"
+    id: sub_temp
+    device_id: sub_climate
+    lambda: "return 21.5;"
+    update_interval: 60s
+
+switch:
+  - platform: template
+    name: "Sub Relay"
+    id: sub_relay
+    device_id: sub_relay_1
+    optimistic: true
+
+# Required transitively by the core component; declared here so the
+# consumer can pick the timeout. (Even MQTT-only firmware needs it
+# today, since the core uses esp_http_client for HTTP provisioning.)
+http_request:
+  id: tb_http
+  timeout: 10s
+
+thingsboard:
+  id: thingsboard_component
+  server_url: "https://demo.thingsboard.io"
+
+thingsboard_mqtt:
+  thingsboard_id: thingsboard_component
+  broker: "demo.thingsboard.io"
+  port: 1883
+  device_token: "0000000000000000000000000000"
+
+thingsboard_gateway:
+  thingsboard_id: thingsboard_component
+  # B-layer: auto-register every `esphome: devices:` sub-device as a TB
+  # gateway child and route its telemetry/RPC through v1/gateway/*.
+  auto_map_sub_devices: true
+  # Statically declared A-layer children with per-child inbound automations.
+  devices:
+    - name: "sensor-hub-1"
+      device_type: "Generic Sensor"
+      auto_connect: true
+      on_child_rpc:
+        then:
+          - logger.log:
+              format: "Child RPC for sensor-hub-1: %s (id=%s)"
+              args: ["method.c_str()", "request_id.c_str()"]
+          - thingsboard_gateway.child_send_rpc_response:
+              device_name: "sensor-hub-1"
+              request_id: !lambda 'return request_id;'
+              data: '{"success":true}'
+      on_child_shared_attributes:
+        then:
+          - logger.log: "Child shared attributes for sensor-hub-1"
+    - name: "relay-node-2"
+      auto_connect: false
+  # Global any-child automations: device_name is the leading trigger arg.
+  on_child_rpc:
+    then:
+      - logger.log:
+          format: "Any-child RPC: %s -> %s"
+          args: ["device_name.c_str()", "method.c_str()"]
+  on_child_shared_attributes:
+    then:
+      - logger.log:
+          format: "Any-child shared attributes: %s"
+          args: ["device_name.c_str()"]

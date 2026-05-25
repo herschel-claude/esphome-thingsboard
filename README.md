@@ -15,6 +15,7 @@ telemetry and RPC come for free.
 | `thingsboard_mqtt_ota` | Chunked-binary OTA over MQTT (`v2/fw/*`), exposed as an `ota:` platform |
 | `thingsboard_http` | HTTP device API ([ref](https://thingsboard.io/docs/reference/http-api/)) |
 | `thingsboard_http_ota` | Streaming HTTPS OTA, exposed as an `ota:` platform |
+| `thingsboard_gateway` | MQTT gateway API ([ref](https://thingsboard.io/docs/reference/gateway-mqtt-api/)): one connection proxies many child devices. A-layer (user-driven via Actions/Triggers) + B-layer (auto-map ESPHome sub-devices). MQTT only. See [`components/thingsboard_gateway/README.md`](components/thingsboard_gateway/README.md). |
 
 A firmware uses **exactly one** of `thingsboard_mqtt:` or `thingsboard_http:`.
 The core component's final-validator rejects builds that configure both
@@ -69,6 +70,31 @@ ota:
     thingsboard_id: thingsboard_component
     http_request_id: tb_http
 ```
+
+## Quick start: Gateway
+
+Adds the ThingsBoard gateway API on top of an existing `thingsboard_mqtt:` setup. One
+MQTT session proxies any number of child devices, each its own ThingsBoard device.
+
+```yaml
+external_components:
+  - source: github://rjt-rockx/esphome-thingsboard@main
+    components: [thingsboard, thingsboard_mqtt, thingsboard_gateway]
+
+thingsboard_gateway:
+  id: gw
+  thingsboard_id: thingsboard_component
+  auto_map_sub_devices: true   # B-layer: auto-route ESPHome `devices:` sub-devices
+  devices:                     # A-layer: explicit children (BLE/Modbus/UART)
+    - name: "Relay 1"
+      on_child_rpc:
+        - lambda: |-
+            ESP_LOGD("gw", "RPC %s on %s", method.c_str(), device_name.c_str());
+```
+
+Full surface (Actions, Triggers, RPC + shared-attribute routing) in
+[`components/thingsboard_gateway/README.md`](components/thingsboard_gateway/README.md).
+The gateway device must have `additionalInfo.gateway = true` on the ThingsBoard side.
 
 ## Picking a transport
 
