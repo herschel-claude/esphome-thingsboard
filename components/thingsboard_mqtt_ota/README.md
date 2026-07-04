@@ -43,6 +43,18 @@ Standard ESPHome OTA triggers (`on_begin` / `on_progress` / `on_end` /
    → `UPDATED`, or `FAILED` with `fw_error`) are reported back as telemetry
    so ThingsBoard's firmware dashboard can track progress.
 
+## QoS1 redelivery
+
+Chunk responses are subscribed at QoS1, so the broker redelivers any chunk
+it has not seen ACKed yet. Duplicate and older chunk indices are therefore
+normal, not errors: they are ignored, and only a forward gap (a chunk that
+was never requested) aborts the update. Each accepted chunk is written to
+flash exactly once, in order. The flash write and the next-chunk request run
+on the main loop rather than the MQTT client task, so a flash erase never
+stalls the socket (a stalled socket is what triggers the redelivery storm in
+the first place). Verified end to end on ESP32-C6 hardware against a
+ThingsBoard staging tenant.
+
 ## `chunk_size`
 
 `chunk_size` is bounded by the broker's `maxPayloadSize` limit (see

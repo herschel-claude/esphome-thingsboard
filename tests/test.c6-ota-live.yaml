@@ -1,0 +1,60 @@
+# Live ESP32-C6 test device for the thingsboard_mqtt_ota chunked OTA path.
+# Self-contained: pulls the components from this repo, connects to a
+# ThingsBoard staging tenant over MQTT, and exposes the mqtt OTA platform.
+# Default ESPHome partition table (ESPHome -> ESPHome OTA; no esp-firmware
+# interop). secrets.yaml (gitignored) supplies wifi + broker + token.
+#
+#   esphome compile tests/test.c6-ota-live.yaml
+#
+# The `version` here is the current-firmware version reported to TB. Bump it
+# for the v+1 build that gets uploaded as the OTA package.
+
+substitutions:
+  device_name: tb-c6-ota
+  fw_version: "1.0.0"
+
+esphome:
+  name: ${device_name}
+  project:
+    name: rjt.tb_c6_ota
+    version: ${fw_version}
+
+esp32:
+  board: esp32-c6-devkitc-1
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components:
+      - thingsboard
+      - thingsboard_mqtt
+      - thingsboard_mqtt_ota
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+http_request:
+  id: tb_http
+  timeout: 10s
+
+thingsboard:
+  id: thingsboard_component
+  server_url: !secret thingsboard_server_url
+
+thingsboard_mqtt:
+  thingsboard_id: thingsboard_component
+  broker: !secret thingsboard_mqtt_broker
+  port: 1883
+  device_token: !secret tb_device_token
+
+ota:
+  - platform: thingsboard_mqtt_ota
+    thingsboard_id: thingsboard_component
+    chunk_size: 4096

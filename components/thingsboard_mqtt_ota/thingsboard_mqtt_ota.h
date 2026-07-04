@@ -4,6 +4,7 @@
 
 #ifdef USE_ESP32
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -56,6 +57,7 @@ class ThingsBoardMqttOtaComponent : public ota::OTAComponent,
 
  protected:
   void request_chunk_(uint32_t chunk_idx);
+  void process_pending_chunk_();
   void finish_();
   void fail_(const std::string &reason);
   void report_state_(const char *state, const std::string &message = "",
@@ -73,6 +75,18 @@ class ThingsBoardMqttOtaComponent : public ota::OTAComponent,
   uint32_t next_chunk_idx_{0};
   size_t bytes_written_{0};
   uint32_t last_progress_report_{0};
+
+  // Inbound chunks arrive on the MQTT client task (on_chunk_received). Flash
+  // writes and the next-chunk request are handed to the main loop instead, so
+  // the MQTT task returns promptly and keeps ACKing QoS1 chunks. Blocking the
+  // MQTT task on a flash erase stalls the socket and makes the broker flood
+  // QoS1 redeliveries. Exactly one chunk is ever in flight, so a single
+  // reusable buffer is enough: the MQTT task fills it and raises chunk_ready_;
+  // the loop consumes it and lowers the flag before requesting the next chunk.
+  std::unique_ptr<uint8_t[]> chunk_buf_;
+  size_t chunk_buf_cap_{0};
+  size_t pending_len_{0};
+  volatile bool chunk_ready_{false};
 };
 
 }  // namespace thingsboard_mqtt_ota

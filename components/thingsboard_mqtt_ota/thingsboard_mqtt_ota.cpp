@@ -2,6 +2,8 @@
 
 #ifdef USE_ESP32
 
+#include <cstring>
+
 #include "esphome/components/json/json_util.h"
 #include "esphome/components/thingsboard/thingsboard_client.h"
 #include "esphome/components/thingsboard_mqtt/thingsboard_mqtt_transport.h"
@@ -43,6 +45,13 @@ void ThingsBoardMqttOtaComponent::setup() {
 void ThingsBoardMqttOtaComponent::loop() {
   if (this->state_ != OTA_RECEIVING)
     return;
+  // A chunk parked by the MQTT task is written to flash here, on the main
+  // loop, so the MQTT task never blocks on a flash erase (see chunk_buf_).
+  if (this->chunk_ready_) {
+    this->process_pending_chunk_();
+    if (this->state_ != OTA_RECEIVING)
+      return;
+  }
   const uint32_t now = millis();
   if (now - this->last_progress_report_ < 5000)
     return;
@@ -78,6 +87,18 @@ void ThingsBoardMqttOtaComponent::on_firmware_advertised(
   this->request_id_ = millis();
   this->next_chunk_idx_ = 0;
   this->bytes_written_ = 0;
+  this->chunk_ready_ = false;
+  this->pending_len_ = 0;
+  // One reusable landing buffer for the single in-flight chunk. Allocated per
+  // OTA (freed in finish_/fail_) rather than held for the device's lifetime.
+  if (this->chunk_buf_cap_ != this->chunk_size_) {
+    this->chunk_buf_ = std::unique_ptr<uint8_t[]>(new uint8_t[this->chunk_size_]);
+    this->chunk_buf_cap_ = this->chunk_size_;
+  }
+  if (this->chunk_buf_ == nullptr) {
+    this->fail_("Chunk buffer allocation failed");
+    return;
+  }
 
   ESP_LOGI(TAG, "OTA advertised: %s v%s (size=%zu, checksum=%s/%s)",
            info.title.c_str(), info.version.c_str(), info.size,
@@ -127,19 +148,61 @@ void ThingsBoardMqttOtaComponent::on_chunk_received(uint32_t request_id, uint32_
              this->request_id_);
     return;
   }
-  if (chunk_idx != this->next_chunk_idx_) {
-    ESP_LOGW(TAG, "Out-of-order chunk %u (expected %u); aborting", chunk_idx,
+  // This runs on the MQTT client task. Under QoS1 the broker redelivers a
+  // chunk it has not seen ACKed yet, so duplicate and older indices are normal,
+  // not errors. Drop anything we have already accepted; only a forward gap
+  // (a chunk we never asked for) is fatal.
+  if (chunk_idx < this->next_chunk_idx_) {
+    ESP_LOGD(TAG, "Ignoring duplicate chunk %u (expected %u)", chunk_idx,
              this->next_chunk_idx_);
-    this->fail_("Out-of-order chunk");
     return;
   }
-  auto write_result = this->backend_->write(const_cast<uint8_t *>(data), len);
+  if (chunk_idx > this->next_chunk_idx_) {
+    ESP_LOGW(TAG, "Chunk gap: got %u, expected %u; aborting", chunk_idx,
+             this->next_chunk_idx_);
+    this->fail_("Chunk gap");
+    return;
+  }
+  // chunk_idx == next_chunk_idx_: the awaited chunk. If the previous one is
+  // still parked for the loop this must not happen (only one chunk is in
+  // flight), but guard rather than clobber the buffer mid-write.
+  if (this->chunk_ready_) {
+    ESP_LOGW(TAG, "Chunk %u arrived while previous still pending; dropping",
+             chunk_idx);
+    return;
+  }
+  if (len > this->chunk_buf_cap_) {
+    ESP_LOGE(TAG, "Chunk %u (%zu bytes) exceeds buffer (%zu)", chunk_idx, len,
+             this->chunk_buf_cap_);
+    this->fail_("Chunk too large");
+    return;
+  }
+  // Copy off the MQTT event buffer (only valid for this callback) and advance
+  // the dedup cursor immediately, so any redelivery of this index now reads as
+  // an older chunk and is dropped above. The loop does the flash write.
+  if (len > 0)
+    memcpy(this->chunk_buf_.get(), data, len);
+  this->pending_len_ = len;
+  this->next_chunk_idx_ = chunk_idx + 1;
+  this->chunk_ready_ = true;  // hand off to loop(); set last
+}
+
+void ThingsBoardMqttOtaComponent::process_pending_chunk_() {
+  const size_t len = this->pending_len_;
+  ota::OTAResponseTypes write_result = ota::OTA_RESPONSE_OK;
+  if (len > 0) {
+    write_result = this->backend_->write(this->chunk_buf_.get(), len);
+  }
+  // Release the buffer before requesting the next chunk so the MQTT task may
+  // refill it the moment the next response lands.
+  this->chunk_ready_ = false;
   if (write_result != ota::OTA_RESPONSE_OK) {
+    ESP_LOGE(TAG, "Chunk %u write failed (backend code %d)",
+             this->next_chunk_idx_ - 1, static_cast<int>(write_result));
     this->fail_("Chunk write failed");
     return;
   }
   this->bytes_written_ += len;
-  this->next_chunk_idx_++;
 
   // Per TB OTA spec: a chunk smaller than the requested size marks EOF.
   if (len < this->chunk_size_) {
@@ -151,6 +214,9 @@ void ThingsBoardMqttOtaComponent::on_chunk_received(uint32_t request_id, uint32_
 }
 
 void ThingsBoardMqttOtaComponent::finish_() {
+  this->chunk_ready_ = false;
+  this->chunk_buf_.reset();
+  this->chunk_buf_cap_ = 0;
   this->state_ = OTA_VERIFIED;
   if (!this->fw_.checksum.empty()) {
     this->report_state_("VERIFIED", "Firmware checksum verified", 100);
@@ -180,6 +246,9 @@ void ThingsBoardMqttOtaComponent::abort() {
   if (this->state_ == OTA_IDLE || this->state_ == OTA_DONE)
     return;
   ESP_LOGW(TAG, "MQTT OTA aborted (state=%d)", this->state_);
+  this->chunk_ready_ = false;
+  this->chunk_buf_.reset();
+  this->chunk_buf_cap_ = 0;
   if (this->backend_) {
     this->backend_->abort();
   }
@@ -190,6 +259,9 @@ void ThingsBoardMqttOtaComponent::abort() {
 
 void ThingsBoardMqttOtaComponent::fail_(const std::string &reason) {
   ESP_LOGE(TAG, "MQTT OTA failed: %s", reason.c_str());
+  this->chunk_ready_ = false;
+  this->chunk_buf_.reset();
+  this->chunk_buf_cap_ = 0;
   if (this->backend_) {
     this->backend_->abort();
   }
