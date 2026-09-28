@@ -339,7 +339,7 @@ public:
   void on_valve_update(valve::Valve *obj) override;
 #endif
 #ifdef USE_TEXT
-  void on_text_update(text::Text *obj, const std::string &state) override;
+  void on_text_update(text::Text *obj) override;
 #endif
 #ifdef USE_DATETIME_DATE
   void on_date_update(datetime::DateEntity *obj) override;
@@ -350,12 +350,6 @@ public:
 #ifdef USE_DATETIME_DATETIME
   void on_datetime_update(datetime::DateTimeEntity *obj) override;
 #endif
-#ifdef USE_LOCK
-  void on_lock_update(lock::Lock *obj) override;
-#endif
-#ifdef USE_VALVE
-  void on_valve_update(valve::Valve *obj) override;
-#endif
 #ifdef USE_MEDIA_PLAYER
   void on_media_player_update(media_player::MediaPlayer *obj) override;
 #endif
@@ -364,10 +358,13 @@ public:
       alarm_control_panel::AlarmControlPanel *obj) override;
 #endif
 #ifdef USE_EVENT
-  void on_event(event::Event *obj, const std::string &event_type) override;
+  void on_event(event::Event *obj) override;
 #endif
 #ifdef USE_UPDATE
   void on_update(update::UpdateEntity *obj) override;
+#endif
+#ifdef USE_WATER_HEATER
+  void on_water_heater_update(water_heater::WaterHeater *obj) override;
 #endif
 
 protected:
@@ -787,8 +784,9 @@ protected:
       std::string scoped_id =
           parent_->get_domain_scoped_id_("select", obj);
       uint32_t device_id = parent_->entity_device_id_(obj);
-      parent_->send_single_telemetry_(scoped_id, obj->state, device_id);
-      parent_->send_single_client_attribute_(scoped_id, obj->state, device_id);
+      std::string state = obj->current_option().str();
+      parent_->send_single_telemetry_(scoped_id, state, device_id);
+      parent_->send_single_client_attribute_(scoped_id, state, device_id);
       return true;
     }
 #endif
@@ -950,6 +948,12 @@ protected:
     // Skip button callbacks as they don't have state
 #ifdef USE_BUTTON
     bool on_button(button::Button *button) override { return true; }
+#endif
+#ifdef USE_WATER_HEATER
+    // Water heaters are not published yet.
+    bool on_water_heater(water_heater::WaterHeater *obj) override {
+      return true;
+    }
 #endif
 
     bool completed() {
