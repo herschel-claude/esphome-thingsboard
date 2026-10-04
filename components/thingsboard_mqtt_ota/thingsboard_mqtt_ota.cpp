@@ -83,6 +83,24 @@ void ThingsBoardMqttOtaComponent::on_firmware_advertised(
     ESP_LOGE(TAG, "No MQTT transport bound; cannot start OTA");
     return;
   }
+#ifdef ESPHOME_PROJECT_NAME
+  if (info.title != ESPHOME_PROJECT_NAME) {
+    ESP_LOGW(TAG, "Ignoring firmware %s v%s: title does not match %s",
+             info.title.c_str(), info.version.c_str(), ESPHOME_PROJECT_NAME);
+    this->report_fw_info_();
+    this->report_state_("FAILED", "Firmware title mismatch", 0);
+    return;
+  }
+#endif
+#ifdef ESPHOME_PROJECT_VERSION
+  if (info.version == ESPHOME_PROJECT_VERSION) {
+    ESP_LOGI(TAG, "Already running firmware %s v%s", info.title.c_str(),
+             info.version.c_str());
+    this->report_fw_info_();
+    this->report_state_("UPDATED", "", -1);
+    return;
+  }
+#endif
   this->fw_ = info;
   this->request_id_ = millis();
   this->next_chunk_idx_ = 0;
