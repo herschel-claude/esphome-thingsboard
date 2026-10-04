@@ -520,6 +520,9 @@ protected:
     std::string value;
     uint32_t timestamp;
     bool is_attribute;
+    // Throttled telemetry is held until this time instead of being dropped.
+    bool deferred{false};
+    uint32_t not_before{0};
   };
   std::map<std::string, PendingMessage> pending_messages_;
   uint32_t last_batch_process_{0};

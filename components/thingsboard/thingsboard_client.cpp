@@ -1834,11 +1834,13 @@ void ThingsBoardComponent::add_to_batch_(const std::string &key,
   // Per-key throttle: telemetry only; throttle gates new entries, but an
   // already-pending value still gets refreshed below.
   bool throttled = false;
+  uint32_t due = 0;
   if (!is_attribute && this->telemetry_throttle_ > 0) {
     auto throttle_it = this->last_key_send_.find(key);
     if (throttle_it != this->last_key_send_.end()) {
       uint32_t elapsed = now - throttle_it->second;
       throttled = (elapsed < this->telemetry_throttle_);
+      due = throttle_it->second + this->telemetry_throttle_;
     }
     if (!throttled) {
       this->last_key_send_[key] = now;
@@ -1863,12 +1865,18 @@ void ThingsBoardComponent::add_to_batch_(const std::string &key,
   if (it != this->pending_messages_.end()) {
     it->second.value = value;
     it->second.timestamp = now;
-  } else if (!throttled) {
+  } else {
     PendingMessage msg;
     msg.key = key;
     msg.value = value;
     msg.timestamp = now;
     msg.is_attribute = is_attribute;
+    if (throttled) {
+      // Defer to the end of the throttle window rather than drop the change.
+      msg.deferred = true;
+      msg.not_before = due;
+      this->last_key_send_[key] = due;
+    }
     this->pending_messages_[key] = msg;
 
     // T5: bounded offline queue. Drop oldest entry by timestamp when over cap.
@@ -1933,7 +1941,11 @@ void ThingsBoardComponent::process_partition_(bool is_attribute) {
   std::vector<std::string> keys;
   keys.reserve(this->pending_messages_.size());
   for (const auto &kv : this->pending_messages_) {
-    if (kv.second.is_attribute == is_attribute) keys.push_back(kv.first);
+    if (kv.second.is_attribute != is_attribute) continue;
+    if (kv.second.deferred &&
+        static_cast<int32_t>(now - kv.second.not_before) < 0)
+      continue;
+    keys.push_back(kv.first);
   }
   if (keys.empty()) return;
 
