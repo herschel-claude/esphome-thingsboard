@@ -131,8 +131,15 @@ void ThingsBoardMqttOtaComponent::on_firmware_advertised(
     this->fail_("OTA backend begin failed");
     return;
   }
+  this->sha256_.reset();
   if (!info.checksum.empty() && info.checksum_algorithm == "MD5") {
     this->backend_->set_update_md5(info.checksum.c_str());
+  } else if (!info.checksum.empty() && info.checksum_algorithm == "SHA256") {
+    this->sha256_ = std::make_unique<sha256::SHA256>();
+    this->sha256_->init();
+  } else if (!info.checksum.empty()) {
+    ESP_LOGW(TAG, "Checksum algorithm %s not supported; image not verified",
+             info.checksum_algorithm.c_str());
   }
 
   this->report_fw_info_();
@@ -210,6 +217,8 @@ void ThingsBoardMqttOtaComponent::process_pending_chunk_() {
   ota::OTAResponseTypes write_result = ota::OTA_RESPONSE_OK;
   if (len > 0) {
     write_result = this->backend_->write(this->chunk_buf_.get(), len);
+    if (write_result == ota::OTA_RESPONSE_OK && this->sha256_)
+      this->sha256_->add(this->chunk_buf_.get(), len);
   }
   // Release the buffer before requesting the next chunk so the MQTT task may
   // refill it the moment the next response lands.
@@ -235,6 +244,16 @@ void ThingsBoardMqttOtaComponent::finish_() {
   this->chunk_ready_ = false;
   this->chunk_buf_.reset();
   this->chunk_buf_cap_ = 0;
+  if (this->sha256_) {
+    this->sha256_->calculate();
+    bool ok = this->sha256_->equals_hex(this->fw_.checksum.c_str());
+    this->sha256_.reset();
+    if (!ok) {
+      this->fail_("Checksum verification failed");
+      return;
+    }
+    ESP_LOGI(TAG, "SHA256 verified");
+  }
   this->state_ = OTA_VERIFIED;
   if (!this->fw_.checksum.empty()) {
     this->report_state_("VERIFIED", "Firmware checksum verified", 100);
@@ -267,6 +286,7 @@ void ThingsBoardMqttOtaComponent::abort() {
   this->chunk_ready_ = false;
   this->chunk_buf_.reset();
   this->chunk_buf_cap_ = 0;
+  this->sha256_.reset();
   if (this->backend_) {
     this->backend_->abort();
   }
@@ -280,6 +300,7 @@ void ThingsBoardMqttOtaComponent::fail_(const std::string &reason) {
   this->chunk_ready_ = false;
   this->chunk_buf_.reset();
   this->chunk_buf_cap_ = 0;
+  this->sha256_.reset();
   if (this->backend_) {
     this->backend_->abort();
   }
