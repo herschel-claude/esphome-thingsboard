@@ -974,7 +974,7 @@ void ThingsBoardComponent::process_bootstrap_() {
           this->initial_state_iterator_ =
               std::make_unique<InitialStateIterator>(this);
         }
-        this->initial_state_iterator_->begin(/*include_internal=*/true);
+        this->initial_state_iterator_->begin(/*include_internal=*/false);
       }
       this->bootstrap_phase_ = BOOT_GW_REPLAY;
       break;

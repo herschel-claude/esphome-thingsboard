@@ -692,15 +692,8 @@ protected:
     bool on_sensor(sensor::Sensor *obj) override {
       char id_buf[OBJECT_ID_MAX_LEN];
       auto id = obj->get_object_id_to(id_buf);
-      ESP_LOGD("thingsboard",
-               "InitialStateIterator: on_sensor called for %s (internal=%s)",
-               id.c_str(), obj->is_internal() ? "true" : "false");
-      if (obj->is_internal()) {
-        ESP_LOGD("thingsboard",
-                 "InitialStateIterator: sensor %s is internal, still sending "
-                 "for completeness",
-                 id.c_str());
-      }
+      if (obj->is_internal())
+        return true;
       ESP_LOGD("thingsboard", "Initial state: sensor %s = %.2f", id.c_str(),
                obj->state);
       if (!std::isnan(obj->state)) {
@@ -727,15 +720,8 @@ protected:
     bool on_switch(switch_::Switch *obj) override {
       char id_buf[OBJECT_ID_MAX_LEN];
       auto id = obj->get_object_id_to(id_buf);
-      ESP_LOGD("thingsboard",
-               "InitialStateIterator: on_switch called for %s (internal=%s)",
-               id.c_str(), obj->is_internal() ? "true" : "false");
-      if (obj->is_internal()) {
-        ESP_LOGD("thingsboard",
-                 "InitialStateIterator: switch %s is internal, still sending "
-                 "for completeness",
-                 id.c_str());
-      }
+      if (obj->is_internal())
+        return true;
       ESP_LOGD("thingsboard", "Initial state: switch %s = %s", id.c_str(),
                obj->state ? "ON" : "OFF");
       std::string scoped_id =
