@@ -771,7 +771,9 @@ protected:
           parent_->get_domain_scoped_id_("select", obj);
       uint32_t device_id = parent_->entity_device_id_(obj);
       std::string state = obj->current_option().str();
-      parent_->send_single_telemetry_(scoped_id, state, device_id);
+      parent_->send_single_telemetry_(
+          scoped_id, static_cast<float>(obj->active_index().value_or(0)),
+          device_id);
       parent_->send_single_client_attribute_(scoped_id, state, device_id);
       return true;
     }
