@@ -641,8 +641,8 @@ void ThingsBoardComponent::handle_provision_response_(
   this->save_device_token_(this->access_token_);
   this->provisioned_ = true;
 
-  ESP_LOGI(TAG, "Device provisioned successfully with token: %s",
-           this->access_token_.c_str());
+  ESP_LOGI(TAG, "Device provisioned successfully (token %u chars)",
+           static_cast<unsigned>(this->access_token_.size()));
 
   if (this->provisioning_via_mqtt_) {
 #ifdef USE_THINGSBOARD_MQTT_TRANSPORT

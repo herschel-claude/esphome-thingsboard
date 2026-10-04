@@ -199,7 +199,7 @@ bool ThingsBoardMQTT::connect() {
   ESP_LOGI(TAG, "Connecting to ThingsBoard MQTT broker: %s:%d (%s)",
            this->broker_host_.c_str(), this->broker_port_,
            this->tls_enabled_() ? "TLS" : "plaintext");
-  // Token is a bearer credential. Redact at INFO; full value visible at DEBUG.
+  // Token is a bearer credential: log only a prefix, at every level.
   if (this->device_token_.size() >= 4) {
     ESP_LOGI(TAG, "Using device token: %.4s... (%u chars)",
              this->device_token_.c_str(),
@@ -208,7 +208,6 @@ bool ThingsBoardMQTT::connect() {
     ESP_LOGI(TAG, "Using device token: (%u chars)",
              static_cast<unsigned>(this->device_token_.size()));
   }
-  ESP_LOGD(TAG, "Using device token: %s", this->device_token_.c_str());
 
   esp_mqtt_client_config_t mqtt_cfg = {};
   this->apply_broker_address_(mqtt_cfg);
