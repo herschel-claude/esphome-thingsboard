@@ -61,6 +61,9 @@ void ThingsBoardMqttOtaComponent::loop() {
     progress = static_cast<int>(100.0f * this->bytes_written_ / this->fw_.size);
   }
   this->report_state_("DOWNLOADING", "Download in progress", progress);
+#ifdef USE_OTA_STATE_LISTENER
+  this->notify_state_(ota::OTA_IN_PROGRESS, static_cast<float>(progress), 0);
+#endif
 }
 
 void ThingsBoardMqttOtaComponent::dump_config() {
@@ -142,6 +145,9 @@ void ThingsBoardMqttOtaComponent::on_firmware_advertised(
              info.checksum_algorithm.c_str());
   }
 
+#ifdef USE_OTA_STATE_LISTENER
+  this->notify_state_deferred_(ota::OTA_STARTED, 0.0f, 0);
+#endif
   this->report_fw_info_();
   this->state_ = OTA_REQUESTING;
   this->report_state_("DOWNLOADING", "Requesting first chunk", 0);
@@ -273,6 +279,9 @@ void ThingsBoardMqttOtaComponent::finish_() {
   }
   this->state_ = OTA_DONE;
   this->report_state_("UPDATED", "Firmware update completed", 100);
+#ifdef USE_OTA_STATE_LISTENER
+  this->notify_state_deferred_(ota::OTA_COMPLETED, 100.0f, 0);
+#endif
   this->defer("mqtt-ota-restart", [this]() {
     ESP_LOGI(TAG, "Rebooting after MQTT OTA");
     App.safe_reboot();
@@ -292,6 +301,9 @@ void ThingsBoardMqttOtaComponent::abort() {
   }
   this->state_ = OTA_FAILED;
   this->report_state_("FAILED", "OTA aborted", 0);
+#ifdef USE_OTA_STATE_LISTENER
+  this->notify_state_deferred_(ota::OTA_ERROR, 0.0f, 0);
+#endif
   this->state_ = OTA_IDLE;
 }
 
@@ -306,6 +318,9 @@ void ThingsBoardMqttOtaComponent::fail_(const std::string &reason) {
   }
   this->state_ = OTA_FAILED;
   this->report_state_("FAILED", reason, 0);
+#ifdef USE_OTA_STATE_LISTENER
+  this->notify_state_deferred_(ota::OTA_ERROR, 0.0f, 0);
+#endif
   this->state_ = OTA_IDLE;
 }
 
