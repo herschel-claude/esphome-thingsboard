@@ -107,15 +107,16 @@ void ThingsBoardComponent::dump_config() {
     ESP_LOGCONFIG(TAG, "  Rate Limits: Not yet received");
   }
   if (!this->claim_secret_key_.empty()) {
-    ESP_LOGCONFIG(TAG, "  Claim Secret Key: " LOG_SECRET("%s"),
-                  this->claim_secret_key_.c_str());
+    ESP_LOGCONFIG(TAG, "  Claim Secret Key: set (%u chars)",
+                  static_cast<unsigned>(this->claim_secret_key_.size()));
   }
   if (this->claim_duration_ms_ > 0) {
     ESP_LOGCONFIG(TAG, "  Claim Duration: %ums", this->claim_duration_ms_);
   }
   if (!this->device_token_.empty()) {
-    ESP_LOGCONFIG(TAG, "  Device Token: " LOG_SECRET("%s"),
-                  this->device_token_.c_str());
+    ESP_LOGCONFIG(TAG, "  Device Token: %.4s... (%u chars)",
+                  this->device_token_.c_str(),
+                  static_cast<unsigned>(this->device_token_.size()));
   } else {
     ESP_LOGCONFIG(TAG, "  Device Token: Not configured");
   }
@@ -475,7 +476,7 @@ bool ThingsBoardComponent::provision_device_mqtt_() {
     }
   });
 
-  ESP_LOGD(TAG, "Provisioning payload: %s", payload.c_str());
+  ESP_LOGD(TAG, "Provisioning payload: %u bytes", static_cast<unsigned>(payload.size()));
 
   // Connect with username="provision"; the actual request is published from
   // on_mqtt_connect_ once the broker is ready.
@@ -511,7 +512,7 @@ bool ThingsBoardComponent::provision_device_http_() {
   });
 
   ESP_LOGV(TAG, "Provisioning URL: %s", provision_url.c_str());
-  ESP_LOGV(TAG, "Provisioning payload: %s", payload.c_str());
+  ESP_LOGV(TAG, "Provisioning payload: %u bytes", static_cast<unsigned>(payload.size()));
 
   std::vector<http_request::Header> headers;
   headers.push_back({"Content-Type", "application/json"});
@@ -2116,11 +2117,10 @@ bool ThingsBoardComponent::claim_device(const std::string &secret_key,
     return false;
   }
 
-  this->claim_device_(secret_key, duration_ms);
-  return true;
+  return this->claim_device_(secret_key, duration_ms);
 }
 
-void ThingsBoardComponent::claim_device_(const std::string &secret_key,
+bool ThingsBoardComponent::claim_device_(const std::string &secret_key,
                                          uint32_t duration_ms) {
   // Per https://thingsboard.io/docs/reference/mqtt-api/#claiming-devices both
   // fields are optional; when omitted TB uses defaults.
@@ -2138,10 +2138,11 @@ void ThingsBoardComponent::claim_device_(const std::string &secret_key,
   bool success = this->transport_ != nullptr &&
                  this->transport_->publish_claim(payload);
   if (success) {
-    ESP_LOGD(TAG, "Device claim request sent: %s", payload.c_str());
+    ESP_LOGD(TAG, "Device claim request sent (duration %ums)", duration_ms);
   } else {
     ESP_LOGE(TAG, "Failed to send device claim request");
   }
+  return success;
 }
 
 bool ThingsBoardComponent::send_rpc_request(const std::string &method,

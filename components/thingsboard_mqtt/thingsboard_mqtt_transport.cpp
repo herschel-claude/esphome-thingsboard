@@ -697,7 +697,7 @@ void ThingsBoardMQTT::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         payload[event->data_len] = '\0';
 
         if (strcmp(topic, PROVISION_TOPIC) == 0) {
-          ESP_LOGD(TAG, "Received provisioning response: %s", payload);
+          ESP_LOGD(TAG, "Received provisioning response (%u bytes)", static_cast<unsigned>(strlen(payload)));
           if (this->on_provision_response_) {
             auto cb = this->on_provision_response_;
             std::string resp(payload);

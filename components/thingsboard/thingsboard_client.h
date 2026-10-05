@@ -646,7 +646,7 @@ protected:
   void send_error_status_(const std::string &message,
                           const std::string &error_code = "");
 
-  void claim_device_(const std::string &secret_key, uint32_t duration_ms);
+  bool claim_device_(const std::string &secret_key, uint32_t duration_ms);
 
   uint32_t rpc_request_counter_{0};
   uint32_t attribute_request_counter_{0};
